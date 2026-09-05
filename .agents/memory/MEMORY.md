@@ -1,0 +1,2 @@
+- [OpenAPI integer compatibility](openapi-zod-integer-compat.md) — keep integer-like fields compatible with the installed Zod runtime when regenerating clients.
+- [Managed workflow health](managed-workflow-health.md) — artifact startup probes must target a real health endpoint; a sandbox SIGTERM after Vite ready is managed lifecycle behavior.

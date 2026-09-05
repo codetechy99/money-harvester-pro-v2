@@ -1,0 +1,8 @@
+money-harvester-backup.zip
+*.zip
+node_modules/
+__pycache__/
+.venv
+venv/
+.env
+

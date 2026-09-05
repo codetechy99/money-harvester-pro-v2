@@ -1,0 +1,883 @@
+openapi: 3.1.0
+info:
+  # Do not change the title, if the title changes, the import paths will be broken
+  title: Api
+  version: 0.1.0
+  description: API specification
+servers:
+  - url: /api
+    description: Base API path
+tags:
+  - name: health
+    description: Health operations
+  - name: broker
+    description: Live MetaApi broker account operations
+  - name: dashboard
+    description: Live dashboard data
+  - name: engine
+    description: Market structure analysis and protected execution
+  - name: journal
+    description: Trading journal and equity history
+  - name: risk
+    description: Account risk controls
+paths:
+  /health:
+    get:
+      operationId: healthCheck
+      tags: [health]
+      summary: Health check
+      description: Returns server health status
+      responses:
+        "200":
+          description: Healthy
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthStatus"
+  /dashboard:
+    get:
+      operationId: getDashboard
+      tags: [dashboard]
+      summary: Read the live dashboard snapshot
+      parameters:
+        - $ref: "#/components/parameters/AccountId"
+      responses:
+        "200":
+          description: Dashboard snapshot
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DashboardSnapshot"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/ServerError"
+  /broker/connect:
+    post:
+      operationId: connectBroker
+      tags: [broker]
+      summary: Provision and connect a live MetaApi account
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/BrokerConnectInput"
+      responses:
+        "200":
+          description: Connected account details
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BrokerAccount"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "502":
+          $ref: "#/components/responses/UpstreamError"
+  /broker/balance:
+    get:
+      operationId: getBrokerBalance
+      tags: [broker]
+      summary: Read live account information and open positions
+      parameters:
+        - $ref: "#/components/parameters/AccountId"
+      responses:
+        "200":
+          description: Live broker snapshot
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BrokerAccount"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "502":
+          $ref: "#/components/responses/UpstreamError"
+  /broker/positions:
+    get:
+      operationId: getBrokerPositions
+      tags: [broker]
+      summary: Read live broker positions
+      parameters:
+        - $ref: "#/components/parameters/AccountId"
+      responses:
+        "200":
+          description: Live broker positions
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Position"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "502":
+          $ref: "#/components/responses/UpstreamError"
+  /broker/market-data:
+    get:
+      operationId: getBrokerMarketData
+      tags: [broker]
+      summary: Read live quote and broker symbol health
+      parameters:
+        - $ref: "#/components/parameters/AccountId"
+        - name: symbol
+          in: query
+          required: true
+          schema:
+            type: string
+            minLength: 1
+        - name: realSymbol
+          in: query
+          required: false
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Live market-data health
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MarketDataHealth"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "502":
+          $ref: "#/components/responses/UpstreamError"
+  /broker/close-all:
+    post:
+      operationId: closeAllPositions
+      tags: [broker]
+      summary: Close every open position for an account
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AccountActionInput"
+      responses:
+        "200":
+          description: Close operation result
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ActionResult"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "502":
+          $ref: "#/components/responses/UpstreamError"
+  /broker/disconnect:
+    post:
+      operationId: disconnectBroker
+      tags: [broker]
+      summary: Undeploy a MetaApi broker account
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AccountActionInput"
+      responses:
+        "200":
+          description: Disconnection result
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DisconnectResult"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "502":
+          $ref: "#/components/responses/UpstreamError"
+  /engine/states:
+    get:
+      operationId: getEngineStates
+      tags: [engine]
+      summary: Read per-symbol strategy states
+      parameters:
+        - $ref: "#/components/parameters/AccountId"
+      responses:
+        "200":
+          description: Strategy state list
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/EngineState"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+  /engine/run:
+    post:
+      operationId: runEngine
+      tags: [engine]
+      summary: Analyze live candles and update strategy state
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/EngineRunInput"
+      responses:
+        "200":
+          description: Updated strategy states
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/EngineState"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "502":
+          $ref: "#/components/responses/UpstreamError"
+  /engine/backtest:
+    post:
+      operationId: runBacktest
+      tags: [engine]
+      summary: Replay real broker candles with explicit trading costs
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/BacktestInput"
+      responses:
+        "200":
+          description: Historical replay result
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BacktestResult"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "502":
+          $ref: "#/components/responses/UpstreamError"
+  /engine/execute:
+    post:
+      operationId: executeTrade
+      tags: [engine]
+      summary: Execute a protected live MetaApi order
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TradeExecuteInput"
+      responses:
+        "200":
+          description: Executed trade
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TradeExecution"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "502":
+          $ref: "#/components/responses/UpstreamError"
+  /journal:
+    get:
+      operationId: getJournal
+      tags: [journal]
+      summary: Read journal entries
+      parameters:
+        - $ref: "#/components/parameters/AccountId"
+      responses:
+        "200":
+          description: Journal entries
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/JournalEntry"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+  /equity-history:
+    get:
+      operationId: getEquityHistory
+      tags: [journal]
+      summary: Read equity history
+      parameters:
+        - $ref: "#/components/parameters/AccountId"
+      responses:
+        "200":
+          description: Equity history points
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/EquityPoint"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+  /risk-settings/{accountId}:
+    get:
+      operationId: getRiskSettings
+      tags: [risk]
+      summary: Read risk limits
+      parameters:
+        - $ref: "#/components/parameters/AccountIdPath"
+      responses:
+        "200":
+          description: Risk settings
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RiskSettings"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+    patch:
+      operationId: updateRiskSettings
+      tags: [risk]
+      summary: Update risk limits
+      parameters:
+        - $ref: "#/components/parameters/AccountIdPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RiskSettingsInput"
+      responses:
+        "200":
+          description: Saved risk settings
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RiskSettings"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+components:
+  parameters:
+    AccountId:
+      name: accountId
+      in: query
+      required: true
+      schema:
+        type: string
+        minLength: 1
+    AccountIdPath:
+      name: accountId
+      in: path
+      required: true
+      schema:
+        type: string
+        minLength: 1
+  responses:
+    BadRequest:
+      description: Invalid request
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    Conflict:
+      description: Trading gate blocked the request
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    UpstreamError:
+      description: Upstream service failure
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    ServerError:
+      description: Server error
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+  schemas:
+    HealthStatus:
+      type: object
+      properties:
+        status:
+          type: string
+      required:
+        - status
+    ErrorResponse:
+      type: object
+      properties:
+        error:
+          type: string
+        code:
+          type: [string, "null"]
+      required: [error]
+    BrokerConnectInput:
+      type: object
+      properties:
+        login:
+          type: string
+          minLength: 1
+        password:
+          type: string
+          minLength: 1
+        server:
+          type: string
+          minLength: 1
+        brokerName:
+          type: string
+          minLength: 1
+      required: [login, password, server, brokerName]
+    BrokerAccount:
+      type: object
+      properties:
+        accountId:
+          type: string
+        brokerName:
+          type: [string, "null"]
+        server:
+          type: [string, "null"]
+        accountType:
+          type: [string, "null"]
+        connectionState:
+          type: [string, "null"]
+        dataSource:
+          type: [string, "null"]
+        balance:
+          type: [number, "null"]
+        equity:
+          type: [number, "null"]
+        leverage:
+          type: [number, "null"]
+        leverageDisplay:
+          type: [string, "null"]
+        currency:
+          type: [string, "null"]
+        margin:
+          type: [number, "null"]
+        freeMargin:
+          type: [number, "null"]
+        marginLevel:
+          type: [number, "null"]
+        connected:
+          type: boolean
+        positions:
+          type: array
+          items:
+            $ref: "#/components/schemas/Position"
+      required: [accountId, connected, positions]
+    MarketDataHealth:
+      type: object
+      properties:
+        symbol:
+          type: string
+        realSymbol:
+          type: string
+        bid:
+          type: [number, "null"]
+        ask:
+          type: [number, "null"]
+        spread:
+          type: [number, "null"]
+        spreadPoints:
+          type: [number, "null"]
+        lastTick:
+          type: [string, "null"]
+        lastCandle:
+          type: [string, "null"]
+        dataSource:
+          type: string
+        dataAgeSeconds:
+          type: [number, "null"]
+        status:
+          type: string
+          enum: [LIVE, STALE, ERROR]
+        marketStatus:
+          type: [string, "null"]
+        specification:
+          type: object
+          additionalProperties: true
+      required: [symbol, realSymbol, dataSource, status]
+    Position:
+      type: object
+      properties:
+        id:
+          type: [string, "null"]
+        symbol:
+          type: [string, "null"]
+        type:
+          type: [string, "null"]
+        volume:
+          type: [number, "null"]
+        openPrice:
+          type: [number, "null"]
+        currentPrice:
+          type: [number, "null"]
+        stopLoss:
+          type: [number, "null"]
+        takeProfit:
+          type: [number, "null"]
+        profit:
+          type: [number, "null"]
+        swap:
+          type: [number, "null"]
+        time:
+          type: [string, "null"]
+      required: [symbol, type, volume, openPrice]
+    AccountActionInput:
+      type: object
+      properties:
+        accountId:
+          type: string
+          minLength: 1
+      required: [accountId]
+    ActionResult:
+      type: object
+      properties:
+        ok:
+          type: boolean
+        message:
+          type: string
+        count:
+          type: number
+        failed:
+          type: array
+          items:
+            type: object
+            properties:
+              positionId:
+                type: string
+              ok:
+                type: boolean
+              error:
+                type: [string, "null"]
+            required: [positionId, ok, error]
+        remaining:
+          type: array
+          items:
+            type: string
+        halted:
+          type: boolean
+      required: [ok, message, count, failed, remaining, halted]
+    DisconnectResult:
+      type: object
+      properties:
+        ok:
+          type: boolean
+        message:
+          type: string
+        count:
+          type: number
+        accountId:
+          type: string
+        state:
+          type: [string, "null"]
+        connectionStatus:
+          type: [string, "null"]
+        connected:
+          type: boolean
+      required: [ok, message, count, accountId, connected]
+    EngineRunInput:
+      type: object
+      properties:
+        accountId:
+          type: string
+          minLength: 1
+        symbols:
+          type: array
+          items:
+            type: string
+          minItems: 1
+      required: [accountId, symbols]
+    BacktestInput:
+      type: object
+      properties:
+        accountId:
+          type: string
+          minLength: 1
+        symbol:
+          type: string
+          minLength: 1
+        timeframe:
+          type: string
+          enum: [1m, 5m, 15m, 1h, 4h, 1d]
+        startTime:
+          type: string
+          format: date-time
+        endTime:
+          type: string
+          format: date-time
+        startingBalance:
+          type: number
+          exclusiveMinimum: 0
+        riskPerTrade:
+          type: number
+          exclusiveMinimum: 0
+        spreadPoints:
+          type: number
+          minimum: 0
+        slippagePoints:
+          type: number
+          minimum: 0
+        commissionPerLot:
+          type: number
+          minimum: 0
+      required: [accountId, symbol, timeframe, startTime, endTime, startingBalance, riskPerTrade, spreadPoints, slippagePoints, commissionPerLot]
+    BacktestTrade:
+      type: object
+      properties:
+        direction:
+          type: string
+          enum: [BUY, SELL]
+        entryTime:
+          type: string
+        exitTime:
+          type: [string, "null"]
+        entry:
+          type: number
+        exit:
+          type: [number, "null"]
+        sl:
+          type: number
+        tp:
+          type: number
+        lot:
+          type: number
+        pnl:
+          type: [number, "null"]
+        outcome:
+          type: string
+          enum: [WIN, LOSS, OPEN]
+      required: [direction, entryTime, entry, sl, tp, lot, outcome]
+    BacktestResult:
+      type: object
+      properties:
+        symbol:
+          type: string
+        realSymbol:
+          type: string
+        timeframe:
+          type: string
+        startTime:
+          type: string
+        endTime:
+          type: string
+        trades:
+          type: array
+          items:
+            $ref: "#/components/schemas/BacktestTrade"
+        startingBalance:
+          type: number
+        endingBalance:
+          type: number
+        netPnl:
+          type: number
+        maxDrawdown:
+          type: number
+        winRate:
+          type: [number, "null"]
+        profitFactor:
+          type: [number, "null"]
+        candleCount:
+          type: number
+        dataSource:
+          type: string
+      required: [symbol, realSymbol, timeframe, startTime, endTime, trades, startingBalance, endingBalance, netPnl, maxDrawdown, candleCount, dataSource]
+    EngineState:
+      type: object
+      properties:
+        id:
+          type: [string, "null"]
+        accountId:
+          type: string
+        symbol:
+          type: string
+        currentState:
+          type: string
+        htfBias:
+          type: [string, "null"]
+        htfConflict:
+          type: boolean
+        trend:
+          type: [string, "null"]
+        poiType:
+          type: [string, "null"]
+        poiHigh:
+          type: [number, "null"]
+        poiLow:
+          type: [number, "null"]
+        diagnostics:
+          type: array
+          items:
+            type: string
+        lastUpdated:
+          type: [string, "null"]
+      required: [accountId, symbol, currentState, htfConflict, diagnostics]
+    TradeExecuteInput:
+      type: object
+      properties:
+        accountId:
+          type: string
+          minLength: 1
+        symbol:
+          type: string
+        realSymbol:
+          type: string
+        direction:
+          type: string
+          enum: [BUY, SELL]
+        lot:
+          type: number
+          exclusiveMinimum: 0
+        sl:
+          type: number
+        tp:
+          type: number
+        poiType:
+          type: [string, "null"]
+        bosMssTag:
+          type: [string, "null"]
+      required: [accountId, symbol, realSymbol, direction, lot, sl, tp]
+    TradeExecution:
+      type: object
+      properties:
+        orderId:
+          type: [string, "null"]
+        positionId:
+          type: [string, "null"]
+        accountId:
+          type: string
+        symbol:
+          type: string
+        direction:
+          type: string
+        lot:
+          type: number
+        entry:
+          type: [number, "null"]
+        sl:
+          type: number
+        tp:
+          type: number
+        leverage:
+          type: [number, "null"]
+        marginUsed:
+          type: [number, "null"]
+        status:
+          type: string
+      required: [accountId, symbol, direction, lot, sl, tp, status]
+    JournalEntry:
+      type: object
+      properties:
+        id:
+          type: string
+        accountId:
+          type: string
+        symbol:
+          type: string
+        realSymbol:
+          type: [string, "null"]
+        direction:
+          type: string
+        entry:
+          type: [number, "null"]
+        sl:
+          type: [number, "null"]
+        tp:
+          type: [number, "null"]
+        lot:
+          type: [number, "null"]
+        pnl:
+          type: [number, "null"]
+        rMultiple:
+          type: [number, "null"]
+        status:
+          type: string
+        poiType:
+          type: [string, "null"]
+        bosMssTag:
+          type: [string, "null"]
+        htfBias:
+          type: [string, "null"]
+        leverage:
+          type: [number, "null"]
+        marginUsed:
+          type: [number, "null"]
+        chartSnapshotUrl:
+          type: [string, "null"]
+        createdAt:
+          type: [string, "null"]
+      required: [id, accountId, symbol, direction, status]
+    EquityPoint:
+      type: object
+      properties:
+        timestamp:
+          type: string
+        balance:
+          type: number
+        equity:
+          type: number
+      required: [timestamp, balance, equity]
+    RiskSettingsInput:
+      type: object
+      properties:
+        riskPerTrade:
+          type: number
+          minimum: 0
+          maximum: 10
+        dailyLoss:
+          type: number
+          minimum: 0
+          maximum: 100
+        weeklyLoss:
+          type: number
+          minimum: 0
+          maximum: 100
+        spreadMultiplier:
+          type: number
+          minimum: 0
+        newsMinutes:
+          type: number
+          minimum: 0
+          maximum: 240
+      required: [riskPerTrade, dailyLoss, weeklyLoss, spreadMultiplier, newsMinutes]
+    RiskSettings:
+      allOf:
+        - $ref: "#/components/schemas/RiskSettingsInput"
+        - type: object
+          properties:
+            accountId:
+              type: string
+          required: [accountId]
+    DashboardSnapshot:
+      type: object
+      properties:
+        account:
+          anyOf:
+            - $ref: "#/components/schemas/BrokerAccount"
+            - type: "null"
+        dailyPnl:
+          type: [number, "null"]
+        dailyPnlPercent:
+          type: [number, "null"]
+        winRate:
+          type: [number, "null"]
+        profitFactor:
+          type: [number, "null"]
+        states:
+          type: array
+          items:
+            $ref: "#/components/schemas/EngineState"
+        journal:
+          type: array
+          items:
+            $ref: "#/components/schemas/JournalEntry"
+        equityHistory:
+          type: array
+          items:
+            $ref: "#/components/schemas/EquityPoint"
+        risk:
+          anyOf:
+            - $ref: "#/components/schemas/RiskSettings"
+            - type: "null"
+        liveData:
+          type: boolean
+        diagnostics:
+          type: array
+          items:
+            type: string
+      required: [states, journal, equityHistory, liveData, diagnostics]
+
