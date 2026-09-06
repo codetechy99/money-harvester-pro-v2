@@ -16,7 +16,8 @@ import {
 import { runBacktest } from "../lib/backtest";
 import { hasHighImpactNewsWithin } from "../lib/market";
 import { analyzeSymbol, SUPPORTED_SYMBOLS } from "../lib/strategy";
-import { findProfile, supabaseRequest } from "../lib/supabase";
+import { findProfile, resolveMetaApiAccountId, supabaseRequest } from "../lib/supabase";
+import { requireAuth, requireAccountOwnership } from "../middlewares/auth";
 
 const router: IRouter = Router();
 
@@ -47,29 +48,31 @@ function mapState(row: Record<string, unknown>) {
   };
 }
 
-async function loadStates(accountId: string) {
+async function loadStates(profileId: string) {
   const rows = await supabaseRequest<Record<string, unknown>[]>("states", {
     query: {
       select: "*",
-      account_id: `eq.${accountId}`,
+      account_id: `eq.${profileId}`,
       order: "symbol.asc",
     },
   });
   return rows.map(mapState);
 }
 
-router.get("/engine/states", async (req, res) => {
+router.get("/engine/states", requireAuth, requireAccountOwnership, async (req, res) => {
   try {
-    const { accountId } = GetEngineStatesQueryParams.parse(req.query);
-    res.json(await loadStates(accountId));
+    const { accountId: profileId } = GetEngineStatesQueryParams.parse(req.query);
+    res.json(await loadStates(profileId));
   } catch (error) {
     res.status(400).json({ error: errorMessage(error) });
   }
 });
 
-router.post("/engine/run", async (req, res) => {
+router.post("/engine/run", requireAuth, requireAccountOwnership, async (req, res) => {
   try {
     const input = RunEngineBody.parse(req.body);
+    const profileId = input.accountId;
+    const metaApiAccountId = await resolveMetaApiAccountId(profileId);
     const symbols = input.symbols.filter((symbol) =>
       (SUPPORTED_SYMBOLS as readonly string[]).includes(symbol),
     );
@@ -80,13 +83,13 @@ router.post("/engine/run", async (req, res) => {
     const results = await Promise.all(
       symbols.map(async (symbol) => {
         try {
-          const result = await analyzeSymbol(input.accountId, symbol);
+          const result = await analyzeSymbol(metaApiAccountId, symbol);
           await supabaseRequest("states", {
             method: "POST",
             query: { on_conflict: "account_id,symbol" },
             prefer: "resolution=merge-duplicates,return=representation",
             body: {
-              account_id: input.accountId,
+              account_id: profileId,
               symbol,
               current_state: result.currentState,
               liquidity_pool: result.liquidityPool,
@@ -98,7 +101,7 @@ router.post("/engine/run", async (req, res) => {
             },
           });
           return {
-            accountId: input.accountId,
+            accountId: profileId,
             symbol,
             currentState: result.currentState,
             htfBias: result.htfBias,
@@ -112,7 +115,7 @@ router.post("/engine/run", async (req, res) => {
           };
         } catch (error) {
           return {
-            accountId: input.accountId,
+            accountId: profileId,
             symbol,
             currentState: "SCANNING",
             htfBias: null,
@@ -134,9 +137,9 @@ router.post("/engine/run", async (req, res) => {
   }
 });
 
-router.post("/engine/backtest", async (req, res) => {
+router.post("/engine/backtest", requireAuth, requireAccountOwnership, async (req, res) => {
   try {
-    const accountId = String(req.body?.accountId ?? "").trim();
+    const profileId = String(req.body?.accountId ?? "").trim();
     const symbol = String(req.body?.symbol ?? "").trim().toUpperCase();
     const timeframe = String(req.body?.timeframe ?? "5m").trim();
     const startTime = String(req.body?.startTime ?? "").trim();
@@ -147,7 +150,7 @@ router.post("/engine/backtest", async (req, res) => {
     const slippagePoints = Number(req.body?.slippagePoints);
     const commissionPerLot = Number(req.body?.commissionPerLot);
     if (
-      !accountId ||
+      !profileId ||
       !symbol ||
       !startTime ||
       !endTime ||
@@ -169,10 +172,11 @@ router.post("/engine/backtest", async (req, res) => {
       res.status(400).json({ error: "Unsupported backtest timeframe" });
       return;
     }
-    const realSymbol = await resolveMetaApiSymbol(accountId, symbol);
+    const metaApiAccountId = await resolveMetaApiAccountId(profileId);
+    const realSymbol = await resolveMetaApiSymbol(metaApiAccountId, symbol);
     const [candles, specification] = await Promise.all([
-      getHistoricalCandles(accountId, realSymbol, timeframe, 5000, { startTime, endTime }),
-      getMetaApiSymbolSpecification(accountId, realSymbol),
+      getHistoricalCandles(metaApiAccountId, realSymbol, timeframe, 5000, { startTime, endTime }),
+      getMetaApiSymbolSpecification(metaApiAccountId, realSymbol),
     ]);
     if (candles.length < 21) {
       res.status(409).json({ error: "Not enough real historical candles returned by MetaApi" });
@@ -200,24 +204,8 @@ router.post("/engine/backtest", async (req, res) => {
   }
 });
 
-function contractSize(symbol: string) {
-  if (symbol.startsWith("XAU")) return 100;
-  if (symbol.startsWith("NAS") || symbol.startsWith("US")) return 1;
-  return 100_000;
-}
-
-function pipValue(symbol: string) {
-  if (symbol.startsWith("XAU")) return 10;
-  if (symbol.startsWith("NAS") || symbol.startsWith("US")) return 1;
-  return 10;
-}
-
-function roundLot(value: number) {
-  return Math.max(0.01, Math.floor(value * 100) / 100);
-}
-
 async function tradeGate(
-  accountId: string,
+  profileId: string,
   symbol: string,
   risk: Record<string, unknown>,
   positions: Array<{ symbol: string }>,
@@ -241,7 +229,7 @@ async function tradeGate(
   const journalRows = await supabaseRequest<Record<string, unknown>[]>("journal", {
     query: {
       select: "pnl,status,created_at",
-      account_id: `eq.${accountId}`,
+      account_id: `eq.${profileId}`,
       status: "eq.CLOSED",
       order: "created_at.desc",
       limit: 500,
@@ -269,12 +257,14 @@ async function tradeGate(
   return diagnostics;
 }
 
-router.post("/engine/execute", async (req, res) => {
+router.post("/engine/execute", requireAuth, requireAccountOwnership, async (req, res) => {
   try {
     const input = ExecuteTradeBody.parse(req.body);
-    const profile = await findProfile(input.accountId);
+    const profileId = input.accountId;
+    const profile = await findProfile(profileId);
+    const metaApiAccountId = await resolveMetaApiAccountId(profileId);
     const riskRows = await supabaseRequest<Record<string, unknown>[]>("risk_settings", {
-      query: { select: "*", account_id: `eq.${input.accountId}`, limit: 1 },
+      query: { select: "*", account_id: `eq.${profileId}`, limit: 1 },
     });
     const risk = riskRows[0] ?? {
       risk_per_trade: 1,
@@ -282,11 +272,11 @@ router.post("/engine/execute", async (req, res) => {
       weekly_loss: 6,
       news_minutes: 30,
     };
-    const live = await getLiveAccountSnapshot(input.accountId, {
+    const live = await getLiveAccountSnapshot(metaApiAccountId, {
       brokerName: typeof profile?.broker_name === "string" ? profile.broker_name : undefined,
       server: typeof profile?.server === "string" ? profile.server : undefined,
     });
-    if (isTradingHalted(input.accountId)) {
+    if (isTradingHalted(profileId)) {
       res.status(409).json({ error: "Trading halted by emergency stop; reconnect and explicitly re-arm the account" });
       return;
     }
@@ -295,7 +285,7 @@ router.post("/engine/execute", async (req, res) => {
       return;
     }
     const diagnostics = await tradeGate(
-      input.accountId,
+      profileId,
       input.symbol,
       { ...risk, __equity: live.equity },
       live.positions.filter(
@@ -308,14 +298,14 @@ router.post("/engine/execute", async (req, res) => {
       return;
     }
     const realSymbol = await resolveMetaApiSymbol(
-      input.accountId,
+      metaApiAccountId,
       input.symbol,
       input.realSymbol,
     );
     const [price, specification, candles] = await Promise.all([
-      getMetaApiSymbolPrice(input.accountId, realSymbol),
-      getMetaApiSymbolSpecification(input.accountId, realSymbol),
-      getHistoricalCandles(input.accountId, realSymbol, "15m", 40),
+      getMetaApiSymbolPrice(metaApiAccountId, realSymbol),
+      getMetaApiSymbolSpecification(metaApiAccountId, realSymbol),
+      getHistoricalCandles(metaApiAccountId, realSymbol, "15m", 40),
     ]);
     const tickTime = price.time ? new Date(price.time).getTime() : NaN;
     if (
@@ -398,7 +388,7 @@ router.post("/engine/execute", async (req, res) => {
       return;
     }
     const result = await executeMetaApiTrade({
-      accountId: input.accountId,
+      accountId: metaApiAccountId,
       actionType: input.direction === "BUY" ? "ORDER_TYPE_BUY" : "ORDER_TYPE_SELL",
       symbol: realSymbol,
       volume: lot,
@@ -417,7 +407,7 @@ router.post("/engine/execute", async (req, res) => {
       method: "POST",
       prefer: "return=representation",
       body: {
-        account_id: input.accountId,
+        account_id: profileId,
         symbol: input.symbol,
         real_symbol: realSymbol,
         direction: input.direction,
@@ -442,7 +432,7 @@ router.post("/engine/execute", async (req, res) => {
     res.json({
       orderId,
       positionId: brokerPositionId,
-      accountId: input.accountId,
+      accountId: profileId,
       symbol: input.symbol,
       direction: input.direction,
       lot,

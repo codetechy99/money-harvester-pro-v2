@@ -1,0 +1,55 @@
+[18:39:35.945] [32mINFO[39m (296336): [36mServer listening[39m
+    [35mport[39m: 3000
+[18:39:37.894] [32mINFO[39m (296336): [36mrequest completed[39m
+    [35mreq[39m: {
+      "id": 1,
+      "method": "GET",
+      "url": "/"
+    }
+    [35mres[39m: {
+      "statusCode": 200
+    }
+    [35mresponseTime[39m: 7
+[18:39:37.907] [32mINFO[39m (296336): [36mrequest completed[39m
+    [35mreq[39m: {
+      "id": 2,
+      "method": "GET",
+      "url": "/health"
+    }
+    [35mres[39m: {
+      "statusCode": 200
+    }
+    [35mresponseTime[39m: 2
+[18:39:37.921] [32mINFO[39m (296336): [36mrequest completed[39m
+    [35mreq[39m: {
+      "id": 3,
+      "method": "GET",
+      "url": "/api/health"
+    }
+    [35mres[39m: {
+      "statusCode": 200
+    }
+    [35mresponseTime[39m: 3
+[18:40:31.538] [32mINFO[39m (296336): [36mrequest completed[39m
+    [35mreq[39m: {
+      "id": 4,
+      "method": "GET",
+      "url": "/api/broker/balance"
+    }
+    [35mres[39m: {
+      "statusCode": 401
+    }
+    [35mresponseTime[39m: 2
+[18:40:31.552] [32mINFO[39m (296336): [36mrequest completed[39m
+    [35mreq[39m: {
+      "id": 5,
+      "method": "GET",
+      "url": "/api/broker/balance"
+    }
+    [35mres[39m: {
+      "statusCode": 400
+    }
+    [35mresponseTime[39m: 3
+[18:41:23.799] [32mINFO[39m (296336): [36mShutting down API server[39m
+    [35msignal[39m: "SIGTERM"
+[18:41:23.799] [32mINFO[39m (296336): [36mAPI server stopped[39m
