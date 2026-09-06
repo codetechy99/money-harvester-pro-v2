@@ -3,9 +3,10 @@ import {
   GetEquityHistoryQueryParams,
   GetJournalQueryParams,
 } from "@workspace/api-zod";
-import { findProfile, supabaseRequest } from "../lib/supabase";
+import { findProfile, resolveMetaApiAccountId, supabaseRequest } from "../lib/supabase";
 import { logger } from "../lib/logger";
 import { reconcileAccountJournal } from "../lib/engine-scheduler";
+import { requireAuth, requireAccountOwnership } from "../middlewares/auth";
 
 const router: IRouter = Router();
 
@@ -36,25 +37,26 @@ function mapJournal(row: Record<string, unknown>) {
   };
 }
 
-router.get("/journal", async (req, res) => {
+router.get("/journal", requireAuth, requireAccountOwnership, async (req, res) => {
   try {
-    const { accountId } = GetJournalQueryParams.parse(req.query);
-    const profile = await findProfile(accountId);
-    if (typeof profile?.metaapi_account_id === "string") {
+    const { accountId: profileId } = GetJournalQueryParams.parse(req.query);
+    const profile = await findProfile(profileId);
+    const metaApiAccountId = await resolveMetaApiAccountId(profileId);
+    if (metaApiAccountId) {
       try {
-        await reconcileAccountJournal(accountId, profile.metaapi_account_id, {
+        await reconcileAccountJournal(profileId, metaApiAccountId, {
           brokerName:
-            typeof profile.broker_name === "string" ? profile.broker_name : undefined,
-          server: typeof profile.server === "string" ? profile.server : undefined,
+            typeof profile?.broker_name === "string" ? profile.broker_name : undefined,
+          server: typeof profile?.server === "string" ? profile.server : undefined,
         });
       } catch (error) {
-        logger.warn({ accountId, error }, "Journal refresh reconciliation failed");
+        logger.warn({ profileId, error }, "Journal refresh reconciliation failed");
       }
     }
     const rows = await supabaseRequest<Record<string, unknown>[]>("journal", {
       query: {
         select: "*",
-        account_id: `eq.${accountId}`,
+        account_id: `eq.${profileId}`,
         order: "created_at.desc",
         limit: 100,
       },
@@ -67,15 +69,15 @@ router.get("/journal", async (req, res) => {
   }
 });
 
-router.get("/equity-history", async (req, res) => {
+router.get("/equity-history", requireAuth, requireAccountOwnership, async (req, res) => {
   try {
-    const { accountId } = GetEquityHistoryQueryParams.parse(req.query);
+    const { accountId: profileId } = GetEquityHistoryQueryParams.parse(req.query);
     const rows = await supabaseRequest<Record<string, unknown>[]>(
       "equity_history",
       {
         query: {
           select: "timestamp,balance,equity",
-          account_id: `eq.${accountId}`,
+          account_id: `eq.${profileId}`,
           order: "timestamp.asc",
           limit: 500,
         },
