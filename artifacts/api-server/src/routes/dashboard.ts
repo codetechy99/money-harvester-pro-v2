@@ -1,7 +1,8 @@
 import { Router, type IRouter } from "express";
 import { GetDashboardQueryParams } from "@workspace/api-zod";
 import { reconcileAccountJournal } from "../lib/engine-scheduler";
-import { findProfile, hasSupabaseConfig, supabaseRequest } from "../lib/supabase";
+import { findProfile, hasSupabaseConfig, resolveMetaApiAccountId, supabaseRequest } from "../lib/supabase";
+import { requireAuth, requireAccountOwnership } from "../middlewares/auth";
 
 const router: IRouter = Router();
 
@@ -69,9 +70,9 @@ function emptySnapshot(diagnostics: string[]) {
   };
 }
 
-router.get("/dashboard", async (req, res) => {
+router.get("/dashboard", requireAuth, requireAccountOwnership, async (req, res) => {
   try {
-    const { accountId } = GetDashboardQueryParams.parse(req.query);
+    const { accountId: profileId } = GetDashboardQueryParams.parse(req.query);
     if (!hasSupabaseConfig()) {
       res.json(
         emptySnapshot([
@@ -81,32 +82,33 @@ router.get("/dashboard", async (req, res) => {
       );
       return;
     }
-    const profile = await findProfile(accountId);
-    if (!profile?.metaapi_account_id) {
+    const profile = await findProfile(profileId);
+    const metaApiAccountId = await resolveMetaApiAccountId(profileId);
+    if (!profile?.metaapi_account_id && !metaApiAccountId) {
       res.json(emptySnapshot(["No live broker account connected"]));
       return;
     }
     const reconciliation = await reconcileAccountJournal(
-      accountId,
-      String(profile.metaapi_account_id),
+      profileId,
+      metaApiAccountId,
       {
-        brokerName: typeof profile.broker_name === "string" ? profile.broker_name : undefined,
-        server: typeof profile.server === "string" ? profile.server : undefined,
+        brokerName: typeof profile?.broker_name === "string" ? profile.broker_name : undefined,
+        server: typeof profile?.server === "string" ? profile.server : undefined,
       },
     );
     const [account, states, journalRows, equityRows, riskRows] = await Promise.all([
       Promise.resolve(reconciliation.account),
       supabaseRequest<Record<string, unknown>[]>("states", {
-        query: { select: "*", account_id: `eq.${accountId}`, order: "symbol.asc" },
+        query: { select: "*", account_id: `eq.${profileId}`, order: "symbol.asc" },
       }),
       supabaseRequest<Record<string, unknown>[]>("journal", {
-        query: { select: "*", account_id: `eq.${accountId}`, order: "created_at.desc", limit: 100 },
+        query: { select: "*", account_id: `eq.${profileId}`, order: "created_at.desc", limit: 100 },
       }),
       supabaseRequest<Record<string, unknown>[]>("equity_history", {
-        query: { select: "timestamp,balance,equity", account_id: `eq.${accountId}`, order: "timestamp.asc", limit: 500 },
+        query: { select: "timestamp,balance,equity", account_id: `eq.${profileId}`, order: "timestamp.asc", limit: 500 },
       }),
       supabaseRequest<Record<string, unknown>[]>("risk_settings", {
-        query: { select: "*", account_id: `eq.${accountId}`, limit: 1 },
+        query: { select: "*", account_id: `eq.${profileId}`, limit: 1 },
       }),
     ]);
     const journal = journalRows.map(mapJournal);
@@ -135,7 +137,7 @@ router.get("/dashboard", async (req, res) => {
       })),
       risk: riskRows[0]
         ? {
-            accountId,
+            accountId: profileId,
             riskPerTrade: Number(riskRows[0].risk_per_trade ?? 1),
             dailyLoss: Number(riskRows[0].daily_loss ?? 3),
             weeklyLoss: Number(riskRows[0].weekly_loss ?? 6),

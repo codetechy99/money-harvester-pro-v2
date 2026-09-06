@@ -7,7 +7,7 @@ type SupabaseOptions = {
   prefer?: string;
 };
 
-function getConfig() {
+export function getConfig() {
   const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
   const key = process.env.SUPABASE_SERVICE_KEY;
   if (!url || !key) {
@@ -72,9 +72,23 @@ export function hasSupabaseConfig() {
   );
 }
 
-export async function findProfile(accountId: string) {
+export async function findProfile(profileId: string) {
+  if (!hasSupabaseConfig()) return null;
   const rows = await supabaseRequest<Record<string, unknown>[]>("profiles", {
-    query: { select: "*", id: `eq.${accountId}`, limit: 1 },
+    query: { select: "*", id: `eq.${profileId}`, limit: 1 },
   });
   return rows[0] ?? null;
+}
+
+export async function resolveMetaApiAccountId(profileIdOrAccountId: string): Promise<string> {
+  if (!hasSupabaseConfig()) return profileIdOrAccountId;
+  try {
+    const profile = await findProfile(profileIdOrAccountId);
+    if (profile?.metaapi_account_id && typeof profile.metaapi_account_id === "string") {
+      return profile.metaapi_account_id;
+    }
+  } catch (error) {
+    logger.warn({ profileIdOrAccountId, error }, "Profile lookup failed, falling back to input ID");
+  }
+  return profileIdOrAccountId;
 }

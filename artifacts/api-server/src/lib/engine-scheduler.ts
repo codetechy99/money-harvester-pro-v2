@@ -1,20 +1,26 @@
 import { logger } from "./logger";
 import {
+  executeMetaApiTrade,
+  getHistoricalCandles,
   getLiveAccountSnapshot,
   getMetaApiHistoryDeals,
+  getMetaApiSymbolPrice,
+  getMetaApiSymbolSpecification,
+  isTradingHalted,
   moveMetaApiPositionStopToBreakEven,
+  resolveMetaApiSymbol,
   type MetaApiHistoryDeal,
 } from "./metaapi";
 import { analyzeSymbol, SUPPORTED_SYMBOLS } from "./strategy";
-import { hasSupabaseConfig, supabaseRequest } from "./supabase";
+import { hasHighImpactNewsWithin } from "./market";
+import { findProfile, hasSupabaseConfig, supabaseRequest } from "./supabase";
 
 let running = false;
 let schedulerTimer: ReturnType<typeof setInterval> | undefined;
 
 type JournalRow = Record<string, unknown> & {
   id?: string;
-  broker_position_id?: string | null;
-  broker_order_id?: string | null;
+  account_id?: string;
   symbol?: string;
   real_symbol?: string | null;
   direction?: string;
@@ -23,6 +29,9 @@ type JournalRow = Record<string, unknown> & {
   initial_sl?: number | null;
   lot?: number | null;
   status?: string;
+  created_at?: string;
+  broker_position_id?: string | null;
+  broker_order_id?: string | null;
 };
 
 function numberValue(value: unknown) {
@@ -171,14 +180,14 @@ async function patchJournalRow(row: JournalRow, patch: Record<string, unknown>) 
 }
 
 export async function reconcileAccountJournal(
-  accountId: string,
+  profileId: string,
   metaApiAccountId: string,
   metadata: { brokerName?: string; server?: string } = {},
 ) {
   const live = await getLiveAccountSnapshot(metaApiAccountId, metadata);
   await supabaseRequest("profiles", {
     method: "PATCH",
-    query: { id: `eq.${accountId}` },
+    query: { id: `eq.${profileId}` },
     body: {
       balance: live.balance,
       equity: live.equity,
@@ -188,14 +197,14 @@ export async function reconcileAccountJournal(
   if (live.balance !== null && live.equity !== null) {
     await supabaseRequest("equity_history", {
       method: "POST",
-      body: { account_id: accountId, balance: live.balance, equity: live.equity },
+      body: { account_id: profileId, balance: live.balance, equity: live.equity },
     });
   }
 
   const openRows = await supabaseRequest<JournalRow[]>("journal", {
     query: {
       select: "*",
-      account_id: `eq.${accountId}`,
+      account_id: `eq.${profileId}`,
       status: "eq.OPEN",
       order: "created_at.asc",
       limit: 500,
@@ -207,7 +216,7 @@ export async function reconcileAccountJournal(
       deals = await getMetaApiHistoryDeals(metaApiAccountId);
     } catch (error) {
       logger.warn(
-        { accountId, metaApiAccountId, error },
+        { profileId, metaApiAccountId, error },
         "MetaApi history deals unavailable; open journal rows remain pending reconciliation",
       );
     }
@@ -221,14 +230,15 @@ export async function reconcileAccountJournal(
     if (position) {
       if (shouldMoveToBreakEven(row, position) && position.id) {
         const entryPrice = numberValue(row.entry) ?? position.openPrice;
-        if (entryPrice === null) continue;
-        await moveMetaApiPositionStopToBreakEven({
-          accountId: metaApiAccountId,
-          positionId: position.id,
-          entryPrice,
-          takeProfit: position.takeProfit,
-        });
-        breakEvenMoves += 1;
+        if (entryPrice !== null) {
+          await moveMetaApiPositionStopToBreakEven({
+            accountId: metaApiAccountId,
+            positionId: position.id,
+            entryPrice,
+            takeProfit: position.takeProfit,
+          });
+          breakEvenMoves += 1;
+        }
       }
       const patch: Record<string, unknown> = {
         broker_position_id: row.broker_position_id ?? position.id,
@@ -274,6 +284,188 @@ export async function reconcileAccountJournal(
   return { account: live, updated, closed, breakEvenMoves };
 }
 
+async function checkIdempotency(
+  profileId: string,
+  symbol: string,
+  candleTimestamp: string,
+  direction: "BUY" | "SELL",
+): Promise<boolean> {
+  const existingRows = await supabaseRequest<JournalRow[]>("journal", {
+    query: {
+      select: "*",
+      account_id: `eq.${profileId}`,
+      symbol: `eq.${symbol}`,
+      direction: `eq.${direction}`,
+      order: "created_at.desc",
+      limit: 20,
+    },
+  });
+
+  const nowMs = new Date(candleTimestamp).getTime();
+  return existingRows.some((row) => {
+    if (row.status === "OPEN") return true; // Block if open position exists
+    const createdAtMs = new Date(String(row.created_at)).getTime();
+    return Math.abs(nowMs - createdAtMs) < 15 * 60 * 1000; // Block if executed in same M15 bar
+  });
+}
+
+export async function evaluateAndAutoExecuteTrade(
+  profileId: string,
+  metaApiAccountId: string,
+  symbol: string,
+) {
+  if (isTradingHalted(profileId) || isTradingHalted(metaApiAccountId)) {
+    return;
+  }
+
+  const analysis = await analyzeSymbol(metaApiAccountId, symbol);
+
+  await supabaseRequest("states", {
+    method: "POST",
+    query: { on_conflict: "account_id,symbol" },
+    prefer: "resolution=merge-duplicates,return=representation",
+    body: {
+      account_id: profileId,
+      symbol,
+      current_state: analysis.currentState,
+      liquidity_pool: analysis.liquidityPool,
+      poi: analysis.poi,
+      diagnostics_log: analysis.diagnostics,
+      htf_bias: analysis.htfBias,
+      htf_conflict: analysis.htfConflict,
+      updated_at: analysis.lastUpdated,
+    },
+  });
+
+  if (analysis.scoreAction === "REJECT" || analysis.setupScore < 55 || !analysis.direction || !analysis.suggestedSl || !analysis.suggestedTp) {
+    return;
+  }
+
+  if (await checkIdempotency(profileId, symbol, analysis.candleTimestamp, analysis.direction)) {
+    logger.info({ profileId, symbol, candleTimestamp: analysis.candleTimestamp }, "Autonomous trade skipped — idempotency block");
+    return;
+  }
+
+  const riskRows = await supabaseRequest<Record<string, unknown>[]>("risk_settings", {
+    query: { select: "*", account_id: `eq.${profileId}`, limit: 1 },
+  });
+  const risk = riskRows[0] ?? {
+    risk_per_trade: 1,
+    daily_loss: 3,
+    weekly_loss: 6,
+    news_minutes: 30,
+  };
+
+  const profile = await findProfile(profileId);
+  const live = await getLiveAccountSnapshot(metaApiAccountId, {
+    brokerName: typeof profile?.broker_name === "string" ? profile.broker_name : undefined,
+    server: typeof profile?.server === "string" ? profile.server : undefined,
+  });
+
+  if (!live.connected || !live.leverage || !live.equity) {
+    return;
+  }
+
+  if (live.positions.some((pos) => pos.symbol === symbol)) {
+    return;
+  }
+
+  const day = new Date();
+  if (day.getUTCDay() === 5 && (day.getUTCHours() > 21 || (day.getUTCHours() === 21 && day.getUTCMinutes() >= 45))) {
+    return;
+  }
+
+  const news = await hasHighImpactNewsWithin(symbol, Number(risk.news_minutes ?? 30));
+  if (news.blocked) {
+    logger.info({ profileId, symbol, event: news.event }, "Autonomous trade blocked by high-impact news filter");
+    return;
+  }
+
+  const realSymbol = await resolveMetaApiSymbol(metaApiAccountId, symbol);
+  const [price, specification] = await Promise.all([
+    getMetaApiSymbolPrice(metaApiAccountId, realSymbol),
+    getMetaApiSymbolSpecification(metaApiAccountId, realSymbol),
+  ]);
+
+  if (!price.bid || !price.ask || !specification.tickSize || !specification.tickValue) {
+    return;
+  }
+
+  const entryPrice = analysis.direction === "BUY" ? price.ask : price.bid;
+  const slDistance = Math.abs(entryPrice - analysis.suggestedSl);
+  if (slDistance <= 0) return;
+
+  const maxConfiguredRiskPercent = Number(risk.risk_per_trade ?? 1);
+  const effectiveRiskPercent =
+    analysis.scoreAction === "REDUCED_RISK"
+      ? Math.min(maxConfiguredRiskPercent, maxConfiguredRiskPercent * 0.5)
+      : maxConfiguredRiskPercent;
+
+  const lossPerLot = (slDistance / specification.tickSize) * specification.tickValue;
+  if (lossPerLot <= 0) return;
+
+  const monetaryRisk = live.equity * (effectiveRiskPercent / 100);
+  const volumeStep = specification.volumeStep ?? 0.01;
+  const rawLot = monetaryRisk / lossPerLot;
+  const lot = Math.floor(rawLot / volumeStep) * volumeStep;
+
+  if (lot < (specification.volumeMin ?? 0.01) || lot > (specification.volumeMax ?? 100)) {
+    logger.warn({ profileId, symbol, lot, min: specification.volumeMin }, "Autonomous trade lot size out of broker limits");
+    return;
+  }
+
+  const contractSize = specification.contractSize ?? 100000;
+  const marginUsed = (lot * contractSize * entryPrice) / live.leverage;
+  if ((live.freeMargin !== null && marginUsed > live.freeMargin) || marginUsed > live.equity * 0.5) {
+    logger.warn({ profileId, symbol, marginUsed, freeMargin: live.freeMargin }, "Autonomous trade blocked by free margin protection");
+    return;
+  }
+
+  const orderResult = await executeMetaApiTrade({
+    accountId: metaApiAccountId,
+    actionType: analysis.direction === "BUY" ? "ORDER_TYPE_BUY" : "ORDER_TYPE_SELL",
+    symbol: realSymbol,
+    volume: lot,
+    stopLoss: analysis.suggestedSl,
+    takeProfit: analysis.suggestedTp,
+  });
+
+  const brokerPositionId = typeof orderResult.positionId === "string" ? orderResult.positionId : null;
+  const brokerOrderId = typeof orderResult.orderId === "string" ? orderResult.orderId : null;
+
+  await supabaseRequest("journal", {
+    method: "POST",
+    prefer: "return=representation",
+    body: {
+      account_id: profileId,
+      symbol,
+      real_symbol: realSymbol,
+      direction: analysis.direction,
+      entry: entryPrice,
+      sl: analysis.suggestedSl,
+      initial_sl: analysis.suggestedSl,
+      tp: analysis.suggestedTp,
+      lot,
+      pnl: 0,
+      r_multiple: 0,
+      status: "OPEN",
+      broker_position_id: brokerPositionId,
+      broker_order_id: brokerOrderId,
+      broker_status: "OPEN",
+      poi_type: analysis.poiType,
+      bos_mss_tag: analysis.poi?.type,
+      htf_bias: analysis.htfBias,
+      leverage: live.leverage,
+      margin_used: marginUsed,
+    },
+  });
+
+  logger.info(
+    { profileId, metaApiAccountId, symbol, direction: analysis.direction, lot, entry: entryPrice, setupScore: analysis.setupScore },
+    "Autonomous trade successfully executed",
+  );
+}
+
 async function runScheduledAnalysis() {
   if (running || !hasSupabaseConfig() || !process.env.METAAPI_TOKEN) return;
   running = true;
@@ -283,6 +475,7 @@ async function runScheduledAnalysis() {
     >("profiles", {
       query: { select: "id,metaapi_account_id", limit: 100 },
     });
+
     await Promise.all(
       profiles
         .filter(
@@ -294,31 +487,20 @@ async function runScheduledAnalysis() {
           await Promise.all(
             SUPPORTED_SYMBOLS.map(async (symbol) => {
               try {
-                const result = await analyzeSymbol(profile.id, symbol);
-                await supabaseRequest("states", {
-                  method: "POST",
-                  query: { on_conflict: "account_id,symbol" },
-                  prefer: "resolution=merge-duplicates,return=representation",
-                  body: {
-                    account_id: profile.id,
-                    symbol,
-                    current_state: result.currentState,
-                    liquidity_pool: result.liquidityPool,
-                    poi: result.poi,
-                    diagnostics_log: result.diagnostics,
-                    htf_bias: result.htfBias,
-                    htf_conflict: result.htfConflict,
-                    updated_at: result.lastUpdated,
-                  },
-                });
+                await evaluateAndAutoExecuteTrade(
+                  profile.id,
+                  profile.metaapi_account_id,
+                  symbol,
+                );
               } catch (error) {
                 logger.warn(
-                  { accountId: profile.id, symbol, error },
-                  "Scheduled strategy analysis failed",
+                  { profileId: profile.id, symbol, error },
+                  "Scheduled trade evaluation failed",
                 );
               }
             }),
           );
+
           try {
             const result = await reconcileAccountJournal(
               profile.id,
@@ -327,7 +509,7 @@ async function runScheduledAnalysis() {
             if (result.updated || result.breakEvenMoves) {
               logger.info(
                 {
-                  accountId: profile.id,
+                  profileId: profile.id,
                   updated: result.updated,
                   closed: result.closed,
                   breakEvenMoves: result.breakEvenMoves,
@@ -337,7 +519,7 @@ async function runScheduledAnalysis() {
             }
           } catch (error) {
             logger.warn(
-              { accountId: profile.id, error },
+              { profileId: profile.id, error },
               "Broker journal reconciliation failed",
             );
           }

@@ -28198,7 +28198,7 @@ var require_pino = __commonJS({
     function pinoBundlerAbsolutePath(p) {
       try {
         const path = __require("path");
-        const outputDir = "/home/runner/workspace/artifacts/api-server/dist";
+        const outputDir = "/app/artifacts/api-server/dist";
         return path.resolve(outputDir, p.replace(/^\.\//, ""));
       } catch (e) {
         const f = new Function("p", "return new URL(p, import.meta.url).pathname");
@@ -33069,10 +33069,10 @@ function serverSuggestions(payload) {
     (value) => typeof value === "string" ? value : value && typeof value === "object" && "server" in value ? String(value.server) : null
   ).filter((value) => Boolean(value)).slice(0, 10);
 }
-async function getMetaApiAccount(accountId) {
+async function getMetaApiAccount(metaApiAccountId) {
   return metaapiFetch(
     PROVISIONING_API,
-    `/users/current/accounts/${encodeURIComponent(accountId)}`
+    `/users/current/accounts/${encodeURIComponent(metaApiAccountId)}`
   );
 }
 async function connectMetaApiAccount(input) {
@@ -33163,21 +33163,21 @@ function mapPosition(position) {
     time: typeof position.time === "string" ? position.time : null
   };
 }
-async function getLiveAccountSnapshot(accountId, metadata = {}) {
+async function getLiveAccountSnapshot(metaApiAccountId, metadata = {}) {
   const [account, info, rawPositions] = await Promise.all([
-    getMetaApiAccount(accountId),
+    getMetaApiAccount(metaApiAccountId),
     metaapiFetch(
       CLIENT_API,
-      `/users/current/accounts/${encodeURIComponent(accountId)}/accountInformation`
+      `/users/current/accounts/${encodeURIComponent(metaApiAccountId)}/accountInformation`
     ),
     metaapiFetch(
       CLIENT_API,
-      `/users/current/accounts/${encodeURIComponent(accountId)}/positions`
+      `/users/current/accounts/${encodeURIComponent(metaApiAccountId)}/positions`
     )
   ]);
   const leverage = typeof info.leverage === "number" && info.leverage > 0 ? Math.round(info.leverage) : null;
   return {
-    accountId,
+    accountId: metaApiAccountId,
     brokerName: metadata.brokerName ?? null,
     server: metadata.server ?? account.server ?? null,
     accountType: account.type ?? null,
@@ -33195,14 +33195,14 @@ async function getLiveAccountSnapshot(accountId, metadata = {}) {
     positions: rawPositions.map(mapPosition)
   };
 }
-async function getMetaApiSymbolInventory(accountId) {
+async function getMetaApiSymbolInventory(metaApiAccountId) {
   return metaapiFetch(
     CLIENT_API,
-    `/users/current/accounts/${encodeURIComponent(accountId)}/symbols`
+    `/users/current/accounts/${encodeURIComponent(metaApiAccountId)}/symbols`
   );
 }
-async function resolveMetaApiSymbol(accountId, displaySymbol, requestedSymbol) {
-  const inventory = await getMetaApiSymbolInventory(accountId);
+async function resolveMetaApiSymbol(metaApiAccountId, displaySymbol, requestedSymbol) {
+  const inventory = await getMetaApiSymbolInventory(metaApiAccountId);
   const symbols = inventory.map(
     (item) => typeof item.symbol === "string" ? item.symbol : typeof item.name === "string" ? item.name : null
   ).filter((symbol) => Boolean(symbol));
@@ -33222,10 +33222,10 @@ async function resolveMetaApiSymbol(accountId, displaySymbol, requestedSymbol) {
   }
   return candidate;
 }
-async function getMetaApiSymbolPrice(accountId, symbol) {
+async function getMetaApiSymbolPrice(metaApiAccountId, symbol) {
   const raw = await metaapiFetch(
     CLIENT_API,
-    `/users/current/accounts/${encodeURIComponent(accountId)}/symbols/${encodeURIComponent(symbol)}/price`
+    `/users/current/accounts/${encodeURIComponent(metaApiAccountId)}/symbols/${encodeURIComponent(symbol)}/price`
   );
   return {
     symbol,
@@ -33235,10 +33235,10 @@ async function getMetaApiSymbolPrice(accountId, symbol) {
     brokerTime: typeof raw.brokerTime === "string" ? raw.brokerTime : null
   };
 }
-async function getMetaApiSymbolSpecification(accountId, symbol) {
+async function getMetaApiSymbolSpecification(metaApiAccountId, symbol) {
   const raw = await metaapiFetch(
     CLIENT_API,
-    `/users/current/accounts/${encodeURIComponent(accountId)}/symbols/${encodeURIComponent(symbol)}/specification`
+    `/users/current/accounts/${encodeURIComponent(metaApiAccountId)}/symbols/${encodeURIComponent(symbol)}/specification`
   );
   return {
     symbol,
@@ -33253,10 +33253,10 @@ async function getMetaApiSymbolSpecification(accountId, symbol) {
     tradeMode: typeof raw.tradeMode === "string" ? raw.tradeMode : null
   };
 }
-async function getMetaApiHistoryDeals(accountId, startTime = new Date(Date.now() - 90 * 24 * 60 * 60 * 1e3).toISOString(), endTime = (/* @__PURE__ */ new Date()).toISOString()) {
+async function getMetaApiHistoryDeals(metaApiAccountId, startTime = new Date(Date.now() - 90 * 24 * 60 * 60 * 1e3).toISOString(), endTime = (/* @__PURE__ */ new Date()).toISOString()) {
   const raw = await metaapiFetch(
     CLIENT_API,
-    `/users/current/accounts/${encodeURIComponent(accountId)}/history-deals?startTime=${encodeURIComponent(startTime)}&endTime=${encodeURIComponent(endTime)}&limit=1000`
+    `/users/current/accounts/${encodeURIComponent(metaApiAccountId)}/history-deals?startTime=${encodeURIComponent(startTime)}&endTime=${encodeURIComponent(endTime)}&limit=1000`
   );
   const deals = Array.isArray(raw) ? raw : raw.deals ?? [];
   return deals.map((deal) => ({
@@ -33290,15 +33290,16 @@ async function moveMetaApiPositionStopToBreakEven(input) {
     }
   );
 }
-async function closeAllMetaApiPositions(accountId, positions) {
-  haltTrading(accountId);
+async function closeAllMetaApiPositions(metaApiAccountId, positions, profileId) {
+  haltTrading(metaApiAccountId);
+  if (profileId) haltTrading(profileId);
   const closable = positions.filter((position) => Boolean(position.id));
   const outcomes = await Promise.all(
     closable.map(async (position) => {
       try {
         await metaapiFetch(
           CLIENT_API,
-          `/users/current/accounts/${encodeURIComponent(accountId)}/trade`,
+          `/users/current/accounts/${encodeURIComponent(metaApiAccountId)}/trade`,
           {
             method: "POST",
             body: JSON.stringify({
@@ -33320,9 +33321,12 @@ async function closeAllMetaApiPositions(accountId, positions) {
   );
   let remaining = [];
   try {
-    const verified = await getLiveAccountSnapshot(accountId);
+    const verified = await getLiveAccountSnapshot(metaApiAccountId);
     remaining = verified.positions.map((position) => position.id).filter((id) => Boolean(id));
-    if (!remaining.length) clearTradingHalt(accountId);
+    if (!remaining.length) {
+      clearTradingHalt(metaApiAccountId);
+      if (profileId) clearTradingHalt(profileId);
+    }
   } catch {
   }
   return {
@@ -33330,30 +33334,31 @@ async function closeAllMetaApiPositions(accountId, positions) {
     closed: outcomes.filter((outcome) => outcome.ok).length,
     failed: outcomes.filter((outcome) => !outcome.ok),
     remaining,
-    halted: isTradingHalted(accountId)
+    halted: isTradingHalted(metaApiAccountId) || (profileId ? isTradingHalted(profileId) : false)
   };
 }
-async function disconnectMetaApiAccount(accountId) {
+async function disconnectMetaApiAccount(metaApiAccountId, profileId) {
   await metaapiFetch(
     PROVISIONING_API,
-    `/users/current/accounts/${encodeURIComponent(accountId)}/undeploy`,
+    `/users/current/accounts/${encodeURIComponent(metaApiAccountId)}/undeploy`,
     { method: "POST" }
   );
-  const status = await getMetaApiAccount(accountId);
-  clearTradingHalt(accountId);
+  const status = await getMetaApiAccount(metaApiAccountId);
+  clearTradingHalt(metaApiAccountId);
+  if (profileId) clearTradingHalt(profileId);
   return {
-    accountId,
+    accountId: metaApiAccountId,
     state: status.state ?? null,
     connectionStatus: status.connectionStatus ?? null,
     connected: status.state === "DEPLOYED" && status.connectionStatus === "CONNECTED"
   };
 }
-async function getHistoricalCandles(accountId, symbol, timeframe = "15m", limit = 240, range = {}) {
+async function getHistoricalCandles(metaApiAccountId, symbol, timeframe = "15m", limit = 240, range = {}) {
   const endTime = range.endTime ?? (/* @__PURE__ */ new Date()).toISOString();
   const startTime = range.startTime ?? new Date(Date.now() - 1e3 * 60 * 60 * 24 * 7).toISOString();
   const raw = await metaapiFetch(
     CLIENT_API,
-    `/users/current/accounts/${encodeURIComponent(accountId)}/historical-candles/${encodeURIComponent(symbol)}?timeframe=${encodeURIComponent(timeframe)}&startTime=${encodeURIComponent(startTime)}&endTime=${encodeURIComponent(endTime)}&limit=${limit}`
+    `/users/current/accounts/${encodeURIComponent(metaApiAccountId)}/historical-candles/${encodeURIComponent(symbol)}?timeframe=${encodeURIComponent(timeframe)}&startTime=${encodeURIComponent(startTime)}&endTime=${encodeURIComponent(endTime)}&limit=${limit}`
   );
   const candles = Array.isArray(raw) ? raw : raw.candles ?? [];
   return candles.map((item) => ({
@@ -33454,11 +33459,114 @@ function hasSupabaseConfig() {
     process.env.NEXT_PUBLIC_SUPABASE_URL && process.env.SUPABASE_SERVICE_KEY
   );
 }
-async function findProfile(accountId) {
+async function findProfile(profileId) {
+  if (!hasSupabaseConfig()) return null;
   const rows = await supabaseRequest("profiles", {
-    query: { select: "*", id: `eq.${accountId}`, limit: 1 }
+    query: { select: "*", id: `eq.${profileId}`, limit: 1 }
   });
   return rows[0] ?? null;
+}
+async function resolveMetaApiAccountId(profileIdOrAccountId) {
+  if (!hasSupabaseConfig()) return profileIdOrAccountId;
+  try {
+    const profile = await findProfile(profileIdOrAccountId);
+    if (profile?.metaapi_account_id && typeof profile.metaapi_account_id === "string") {
+      return profile.metaapi_account_id;
+    }
+  } catch (error) {
+    logger.warn({ profileIdOrAccountId, error }, "Profile lookup failed, falling back to input ID");
+  }
+  return profileIdOrAccountId;
+}
+
+// src/middlewares/auth.ts
+async function requireAuth(req, res, next) {
+  try {
+    const authHeader = req.headers.authorization;
+    const apiKeyHeader = req.headers["x-api-key"];
+    let profileId;
+    if (authHeader && authHeader.startsWith("Bearer ")) {
+      const token = authHeader.substring(7).trim();
+      if (token) {
+        if (hasSupabaseConfig()) {
+          try {
+            const { url, key } = getConfig();
+            const authRes = await fetch(`${url}/auth/v1/user`, {
+              headers: {
+                apikey: key,
+                Authorization: `Bearer ${token}`
+              }
+            });
+            if (authRes.ok) {
+              const userData = await authRes.json();
+              if (userData.id) {
+                profileId = userData.id;
+                req.user = { id: userData.id, email: userData.email };
+              }
+            }
+          } catch {
+          }
+        }
+        if (!profileId) {
+          if (hasSupabaseConfig()) {
+            const profile = await findProfile(token);
+            if (profile && profile.id) {
+              profileId = String(profile.id);
+            }
+          } else {
+            profileId = token;
+          }
+        }
+      }
+    } else if (typeof apiKeyHeader === "string" && apiKeyHeader.trim()) {
+      const apiKey = apiKeyHeader.trim();
+      if (process.env.API_SECRET_KEY && apiKey === process.env.API_SECRET_KEY) {
+        const queryAcc = typeof req.query.accountId === "string" ? req.query.accountId.trim() : "";
+        const bodyAcc = typeof req.body?.accountId === "string" ? req.body.accountId.trim() : "";
+        const paramAcc = typeof req.params?.accountId === "string" ? req.params.accountId.trim() : "";
+        profileId = queryAcc || bodyAcc || paramAcc || "system";
+      } else if (hasSupabaseConfig()) {
+        const profile = await findProfile(apiKey);
+        if (profile && profile.id) {
+          profileId = String(profile.id);
+        }
+      }
+    }
+    if (!profileId) {
+      res.status(401).json({ error: "Authentication required: missing or invalid authorization token" });
+      return;
+    }
+    req.authProfileId = profileId;
+    next();
+  } catch (error) {
+    res.status(401).json({
+      error: error instanceof Error ? error.message : "Authentication failed"
+    });
+  }
+}
+async function requireAccountOwnership(req, res, next) {
+  const targetAccountId = typeof req.params.accountId === "string" && req.params.accountId.trim() || typeof req.query.accountId === "string" && req.query.accountId.trim() || typeof req.body?.accountId === "string" && req.body.accountId.trim();
+  if (!targetAccountId) {
+    res.status(400).json({ error: "Target account ID is required" });
+    return;
+  }
+  if (!req.authProfileId) {
+    res.status(401).json({ error: "Authentication required" });
+    return;
+  }
+  if (req.authProfileId !== targetAccountId && req.authProfileId !== "system") {
+    if (hasSupabaseConfig()) {
+      const profile = await findProfile(req.authProfileId);
+      if (!profile || profile.id !== targetAccountId && profile.metaapi_account_id !== targetAccountId) {
+        res.status(403).json({ error: "Access denied: unauthorized account access" });
+        return;
+      }
+    } else {
+      res.status(403).json({ error: "Access denied: account ID mismatch" });
+      return;
+    }
+  }
+  next();
 }
 
 // src/routes/broker.ts
@@ -33470,49 +33578,51 @@ function errorStatus(error, message) {
   if (Array.isArray(error?.issues)) return 400;
   return message.startsWith("Add ") ? 400 : 502;
 }
-router2.post("/broker/connect", async (req, res) => {
+router2.post("/broker/connect", requireAuth, async (req, res) => {
   try {
     const input = ConnectBrokerBody.parse(req.body);
-    const account = await connectMetaApiAccount(input);
+    const snapshot = await connectMetaApiAccount(input);
+    const profileId = input.login;
     await supabaseRequest("profiles", {
       method: "POST",
       query: { on_conflict: "id" },
       prefer: "resolution=merge-duplicates,return=representation",
       body: {
-        id: account.accountId,
-        metaapi_account_id: account.accountId,
+        id: profileId,
+        metaapi_account_id: snapshot.accountId,
         broker_name: input.brokerName,
         server: input.server,
         login: input.login,
-        leverage: account.leverage,
-        balance: account.balance,
-        equity: account.equity,
-        account_type: account.accountType,
-        connection_state: account.connectionState ?? "CONNECTED"
+        leverage: snapshot.leverage,
+        balance: snapshot.balance,
+        equity: snapshot.equity,
+        account_type: snapshot.accountType,
+        connection_state: snapshot.connectionState ?? "CONNECTED"
       }
     });
-    res.json(account);
+    res.json(snapshot);
   } catch (error) {
     const message = errorMessage(error);
     const status = errorStatus(error, message);
     res.status(status).json({ error: message });
   }
 });
-router2.get("/broker/balance", async (req, res) => {
+router2.get("/broker/balance", requireAuth, requireAccountOwnership, async (req, res) => {
   try {
     if (typeof req.query.accountId !== "string" || !req.query.accountId.trim()) {
       res.status(400).json({ error: "accountId is required" });
       return;
     }
-    const { accountId } = GetBrokerBalanceQueryParams.parse(req.query);
-    const profile = await findProfile(accountId);
-    const live = await getLiveAccountSnapshot(accountId, {
+    const { accountId: profileId } = GetBrokerBalanceQueryParams.parse(req.query);
+    const profile = await findProfile(profileId);
+    const metaApiAccountId = await resolveMetaApiAccountId(profileId);
+    const live = await getLiveAccountSnapshot(metaApiAccountId, {
       brokerName: typeof profile?.broker_name === "string" ? profile.broker_name : void 0,
       server: typeof profile?.server === "string" ? profile.server : void 0
     });
     await supabaseRequest("profiles", {
       method: "PATCH",
-      query: { id: `eq.${accountId}` },
+      query: { id: `eq.${profileId}` },
       body: {
         balance: live.balance,
         equity: live.equity,
@@ -33523,7 +33633,7 @@ router2.get("/broker/balance", async (req, res) => {
       await supabaseRequest("equity_history", {
         method: "POST",
         body: {
-          account_id: accountId,
+          account_id: profileId,
           balance: live.balance,
           equity: live.equity
         }
@@ -33535,15 +33645,16 @@ router2.get("/broker/balance", async (req, res) => {
     res.status(errorStatus(error, message)).json({ error: message });
   }
 });
-router2.get("/broker/positions", async (req, res) => {
+router2.get("/broker/positions", requireAuth, requireAccountOwnership, async (req, res) => {
   try {
     if (typeof req.query.accountId !== "string" || !req.query.accountId.trim()) {
       res.status(400).json({ error: "accountId is required" });
       return;
     }
-    const { accountId } = GetBrokerBalanceQueryParams.parse(req.query);
-    const profile = await findProfile(accountId);
-    const live = await getLiveAccountSnapshot(accountId, {
+    const { accountId: profileId } = GetBrokerBalanceQueryParams.parse(req.query);
+    const profile = await findProfile(profileId);
+    const metaApiAccountId = await resolveMetaApiAccountId(profileId);
+    const live = await getLiveAccountSnapshot(metaApiAccountId, {
       brokerName: typeof profile?.broker_name === "string" ? profile.broker_name : void 0,
       server: typeof profile?.server === "string" ? profile.server : void 0
     });
@@ -33553,24 +33664,25 @@ router2.get("/broker/positions", async (req, res) => {
     res.status(errorStatus(error, message)).json({ error: message });
   }
 });
-router2.get("/broker/market-data", async (req, res) => {
+router2.get("/broker/market-data", requireAuth, requireAccountOwnership, async (req, res) => {
   try {
-    const accountId = String(req.query.accountId ?? "").trim();
+    const profileId = String(req.query.accountId ?? "").trim();
     const symbol = String(req.query.symbol ?? "").trim().toUpperCase();
     const requestedRealSymbol = String(req.query.realSymbol ?? "").trim() || void 0;
-    if (!accountId || !symbol) {
+    if (!profileId || !symbol) {
       res.status(400).json({ error: "accountId and symbol are required" });
       return;
     }
+    const metaApiAccountId = await resolveMetaApiAccountId(profileId);
     const realSymbol = await resolveMetaApiSymbol(
-      accountId,
+      metaApiAccountId,
       symbol,
       requestedRealSymbol
     );
     const [price, specification, candles] = await Promise.all([
-      getMetaApiSymbolPrice(accountId, realSymbol),
-      getMetaApiSymbolSpecification(accountId, realSymbol),
-      getHistoricalCandles(accountId, realSymbol, "5m", 2)
+      getMetaApiSymbolPrice(metaApiAccountId, realSymbol),
+      getMetaApiSymbolSpecification(metaApiAccountId, realSymbol),
+      getHistoricalCandles(metaApiAccountId, realSymbol, "5m", 2)
     ]);
     const lastTickMs = price.time ? new Date(price.time).getTime() : NaN;
     const dataAgeSeconds = Number.isFinite(lastTickMs) ? Math.max(0, (Date.now() - lastTickMs) / 1e3) : null;
@@ -33597,13 +33709,14 @@ router2.get("/broker/market-data", async (req, res) => {
     res.status(errorStatus(error, message)).json({ error: message });
   }
 });
-router2.post("/broker/disconnect", async (req, res) => {
+router2.post("/broker/disconnect", requireAuth, requireAccountOwnership, async (req, res) => {
   try {
-    const { accountId } = CloseAllPositionsBody.parse(req.body);
-    const result = await disconnectMetaApiAccount(accountId);
+    const { accountId: profileId } = CloseAllPositionsBody.parse(req.body);
+    const metaApiAccountId = await resolveMetaApiAccountId(profileId);
+    const result = await disconnectMetaApiAccount(metaApiAccountId);
     await supabaseRequest("profiles", {
       method: "PATCH",
-      query: { id: `eq.${accountId}` },
+      query: { id: `eq.${profileId}` },
       body: { connection_state: "DISCONNECTED" }
     });
     res.json({ ok: true, message: "MetaApi account undeployed", count: 0, ...result });
@@ -33612,11 +33725,12 @@ router2.post("/broker/disconnect", async (req, res) => {
     res.status(errorStatus(error, message)).json({ error: message });
   }
 });
-router2.post("/broker/close-all", async (req, res) => {
+router2.post("/broker/close-all", requireAuth, requireAccountOwnership, async (req, res) => {
   try {
-    const { accountId } = CloseAllPositionsBody.parse(req.body);
-    const live = await getLiveAccountSnapshot(accountId);
-    const result = await closeAllMetaApiPositions(accountId, live.positions);
+    const { accountId: profileId } = CloseAllPositionsBody.parse(req.body);
+    const metaApiAccountId = await resolveMetaApiAccountId(profileId);
+    const live = await getLiveAccountSnapshot(metaApiAccountId);
+    const result = await closeAllMetaApiPositions(metaApiAccountId, live.positions, profileId);
     res.json({
       ok: result.failed.length === 0 && result.remaining.length === 0,
       message: result.remaining.length ? `Emergency stop incomplete: ${result.remaining.length} position(s) remain open` : result.closed ? `Emergency stop verified for ${result.closed} live position${result.closed === 1 ? "" : "s"}` : "No live positions to close",
@@ -33671,9 +33785,9 @@ function detectSwings(candles, radius) {
   }
   return result;
 }
-function findPools(candles, swings, averageAtr2) {
+function findPools(candles, swings, averageAtr) {
   const pools = [];
-  const threshold = averageAtr2 * 0.15;
+  const threshold = averageAtr * 0.15;
   const highs = swings.filter((swing) => swing.type === "HIGH");
   const lows = swings.filter((swing) => swing.type === "LOW");
   for (const [type, candidates] of [
@@ -33683,7 +33797,7 @@ function findPools(candles, swings, averageAtr2) {
     for (let index = 0; index < candidates.length; index += 1) {
       const current = candidates[index];
       const matches = candidates.filter(
-        (candidate) => Math.abs(candidate.index - current.index) >= 5 && Math.abs(candidate.index - current.index) <= 50 && Math.abs(candidate.price - current.price) <= threshold
+        (candidate) => Math.abs(candidate.index - current.index) >= 3 && Math.abs(candidate.index - current.index) <= 50 && Math.abs(candidate.price - current.price) <= threshold
       );
       if (matches.length) {
         const prices = [current, ...matches].map((item) => item.price);
@@ -33694,7 +33808,7 @@ function findPools(candles, swings, averageAtr2) {
           pools.push({
             type,
             avgPrice,
-            strength: prices.length,
+            strength: prices.length + 1,
             swept: false
           });
         }
@@ -33715,41 +33829,124 @@ function calculateTrend(swings) {
   }
   return "RANGING";
 }
-function inferPoi(candles, internalSwings, pools, averageAtr2) {
-  const recent = candles.slice(-3);
+function inferPoi(closedCandles, internalSwings, pools, averageAtr) {
+  if (closedCandles.length < 10) return { poi: null, swept: false, fvg: null, bosMss: null };
+  for (let i = closedCandles.length - 2; i >= Math.max(2, closedCandles.length - 15); i--) {
+    const candle1 = closedCandles[i - 2];
+    const candle2 = closedCandles[i - 1];
+    const candle3 = closedCandles[i];
+    if (candle3.low > candle1.high && candle2.close > candle2.open) {
+      const gapSize = candle3.low - candle1.high;
+      if (gapSize >= averageAtr * 0.15) {
+        return {
+          poi: {
+            high: candle3.low,
+            low: candle1.high,
+            creationIndex: i - 1,
+            creationTime: candle2.time,
+            expiryIndex: i - 1 + 50,
+            touched: false,
+            type: "FVG_BULL"
+          },
+          swept: true,
+          fvg: { high: candle3.low, low: candle1.high },
+          bosMss: "BOS_BULL"
+        };
+      }
+    }
+    if (candle1.low > candle3.high && candle2.close < candle2.open) {
+      const gapSize = candle1.low - candle3.high;
+      if (gapSize >= averageAtr * 0.15) {
+        return {
+          poi: {
+            high: candle1.low,
+            low: candle3.high,
+            creationIndex: i - 1,
+            creationTime: candle2.time,
+            expiryIndex: i - 1 + 50,
+            touched: false,
+            type: "FVG_BEAR"
+          },
+          swept: true,
+          fvg: { high: candle1.low, low: candle3.high },
+          bosMss: "BOS_BEAR"
+        };
+      }
+    }
+  }
+  const recent = closedCandles.slice(-5);
   for (let offset = recent.length - 1; offset >= 0; offset -= 1) {
-    const candleIndex = candles.length - recent.length + offset;
+    const candleIndex = closedCandles.length - recent.length + offset;
     const candle = recent[offset];
     const body = Math.abs(candle.close - candle.open);
-    const sameColorBefore = candles.slice(Math.max(0, candleIndex - 2), candleIndex).filter((item) => Math.sign(item.close - item.open) === Math.sign(candle.close - candle.open)).length;
+    const sameColorBefore = closedCandles.slice(Math.max(0, candleIndex - 2), candleIndex).filter((item) => Math.sign(item.close - item.open) === Math.sign(candle.close - candle.open)).length;
     const breaksOpposite = internalSwings.some(
       (swing) => swing.index < candleIndex && (candle.close > swing.price && swing.type === "HIGH" || candle.close < swing.price && swing.type === "LOW")
     );
     const activeSweep = pools.find((pool) => {
-      const wick = pool.type === "BSL" ? candle.high >= pool.avgPrice + averageAtr2 * 0.2 : candle.low <= pool.avgPrice - averageAtr2 * 0.2;
+      const wick = pool.type === "BSL" ? candle.high >= pool.avgPrice + averageAtr * 0.1 : candle.low <= pool.avgPrice - averageAtr * 0.1;
       const closeBack = pool.type === "BSL" ? candle.close < pool.avgPrice : candle.close > pool.avgPrice;
       const candleBody = Math.abs(candle.close - candle.open);
       const wickLength = pool.type === "BSL" ? candle.high - Math.max(candle.open, candle.close) : Math.min(candle.open, candle.close) - candle.low;
       return wick && closeBack && wickLength > candleBody;
     });
-    if (body > averageAtr2 * 1.5 && sameColorBefore >= 2 && breaksOpposite) {
+    if (body > averageAtr * 1.2 && sameColorBefore >= 1 && breaksOpposite) {
       const bullish = candle.close > candle.open;
       return {
         poi: {
           high: candle.high,
           low: candle.low,
           creationIndex: candleIndex,
+          creationTime: candle.time,
           expiryIndex: candleIndex + 50,
           touched: false,
           type: bullish ? "OB_BULL" : "OB_BEAR"
         },
-        swept: Boolean(activeSweep)
+        swept: Boolean(activeSweep),
+        fvg: null,
+        bosMss: bullish ? "MSS_BULL" : "MSS_BEAR"
       };
     }
   }
-  return { poi: null, swept: false };
+  return { poi: null, swept: false, fvg: null, bosMss: null };
 }
-async function analyzeSymbol(accountId, baseSymbol) {
+function calculateSetupScore(params) {
+  let score = 0;
+  if (params.htfBias && !params.htfConflict) {
+    score += 25;
+  } else if (params.htfBias && params.htfConflict) {
+    score += 10;
+  }
+  if (params.sweep) {
+    score += 20;
+  } else if (params.displacement.swept) {
+    score += 15;
+  }
+  if (params.displacement.poi) {
+    score += 20;
+  }
+  if (params.displacement.bosMss) {
+    score += 15;
+  }
+  if (params.displacement.poi?.type.startsWith("FVG")) {
+    score += 10;
+  } else if (params.displacement.poi?.type.startsWith("OB")) {
+    score += 8;
+  }
+  if (params.m5Confirmed) {
+    score += 10;
+  }
+  let action = "REJECT";
+  if (score >= 70) {
+    action = "NORMAL_RISK";
+  } else if (score >= 55) {
+    action = "REDUCED_RISK";
+  } else {
+    action = "REJECT";
+  }
+  return { score, action };
+}
+async function analyzeSymbol(metaApiAccountId, baseSymbol) {
   const candidates = [
     baseSymbol,
     `${baseSymbol}.m`,
@@ -33759,24 +33956,24 @@ async function analyzeSymbol(accountId, baseSymbol) {
     baseSymbol === "US30" ? "DJ30" : baseSymbol
   ];
   let realSymbol = baseSymbol;
-  let m15 = [];
+  let rawM15 = [];
   for (const candidate of candidates) {
     try {
-      const result = await getHistoricalCandles(accountId, candidate, "15m", 320);
+      const result = await getHistoricalCandles(metaApiAccountId, candidate, "15m", 320);
       if (result.length) {
         realSymbol = candidate;
-        m15 = result;
+        rawM15 = result;
         break;
       }
     } catch {
     }
   }
   const [h4, daily, m5] = await Promise.all([
-    getHistoricalCandles(accountId, realSymbol, "4h", 120),
-    getHistoricalCandles(accountId, realSymbol, "1d", 60),
-    getHistoricalCandles(accountId, realSymbol, "5m", 80)
+    getHistoricalCandles(metaApiAccountId, realSymbol, "4h", 120),
+    getHistoricalCandles(metaApiAccountId, realSymbol, "1d", 60),
+    getHistoricalCandles(metaApiAccountId, realSymbol, "5m", 80)
   ]);
-  if (m15.length < 40) {
+  if (rawM15.length < 40) {
     return {
       realSymbol,
       currentState: "SCANNING",
@@ -33786,42 +33983,79 @@ async function analyzeSymbol(accountId, baseSymbol) {
       poiType: null,
       poiHigh: null,
       poiLow: null,
+      setupScore: 0,
+      scoreAction: "REJECT",
+      direction: null,
+      suggestedEntry: null,
+      suggestedSl: null,
+      suggestedTp: null,
+      candleTimestamp: (/* @__PURE__ */ new Date()).toISOString(),
       diagnostics: ["SCANNING \u2014 not enough live M15 candles returned by MetaApi"],
       lastUpdated: (/* @__PURE__ */ new Date()).toISOString(),
       liquidityPool: [],
       poi: null
     };
   }
-  const averageAtr2 = atr(m15);
-  const externalSwings = detectSwings(m15, 10);
-  const internalSwings = detectSwings(m15, 5);
+  const closedM15 = rawM15.slice(0, -1);
+  const formingCandle = rawM15[rawM15.length - 1];
+  const averageAtr = atr(closedM15);
+  const externalSwings = detectSwings(closedM15, 10);
+  const internalSwings = detectSwings(closedM15, 5);
   const trend = calculateTrend(externalSwings);
-  const pools = findPools(m15, externalSwings, averageAtr2);
+  const pools = findPools(closedM15, externalSwings, averageAtr);
   const sweep = pools.find((pool) => {
-    const candle = m15[m15.length - 1];
-    return pool.type === "BSL" ? candle.high >= pool.avgPrice + averageAtr2 * 0.2 && candle.close < pool.avgPrice : candle.low <= pool.avgPrice - averageAtr2 * 0.2 && candle.close > pool.avgPrice;
+    const candle = closedM15[closedM15.length - 1];
+    return pool.type === "BSL" ? candle.high >= pool.avgPrice + averageAtr * 0.15 && candle.close < pool.avgPrice : candle.low <= pool.avgPrice - averageAtr * 0.15 && candle.close > pool.avgPrice;
   });
-  const displacement = inferPoi(m15, internalSwings, pools, averageAtr2);
-  const dailyTrend = calculateTrend(detectSwings(daily, 3));
-  const h4Trend = calculateTrend(detectSwings(h4, 5));
-  const current = m15[m15.length - 1];
+  const displacement = inferPoi(closedM15, internalSwings, pools, averageAtr);
+  const dailyTrend = calculateTrend(detectSwings(daily.slice(0, -1), 3));
+  const h4Trend = calculateTrend(detectSwings(h4.slice(0, -1), 5));
+  const currentClose = formingCandle.close;
   const dailyHigh = Math.max(...daily.slice(-50).map((candle) => candle.high));
   const dailyLow = Math.min(...daily.slice(-50).map((candle) => candle.low));
   const equilibrium = (dailyHigh + dailyLow) / 2;
-  const htfBias = dailyTrend === "BULLISH" && current.close <= equilibrium ? "BULLISH_DISCOUNT" : dailyTrend === "BEARISH" && current.close >= equilibrium ? "BEARISH_PREMIUM" : dailyTrend ?? null;
+  const htfBias = dailyTrend === "BULLISH" && currentClose <= equilibrium ? "BULLISH_DISCOUNT" : dailyTrend === "BEARISH" && currentClose >= equilibrium ? "BEARISH_PREMIUM" : dailyTrend ?? null;
   const htfConflict = dailyTrend === "BULLISH" && h4Trend === "BEARISH" || dailyTrend === "BEARISH" && h4Trend === "BULLISH";
   const poi = displacement.poi;
   const poiTouched = poi && m5.some(
-    (candle) => candle.time > m15[m15.length - 1].time && candle.high >= poi.low && candle.low <= poi.high
+    (candle) => candle.time >= poi.creationTime && candle.high >= poi.low && candle.low <= poi.high
   );
+  const m5Confirmed = Boolean(poiTouched);
+  const { score: setupScore, action: scoreAction } = calculateSetupScore({
+    htfBias,
+    htfConflict,
+    sweep: sweep ?? null,
+    displacement,
+    trend,
+    m5Confirmed
+  });
   const state = poi ? poiTouched ? "LTF_CONFIRM_M5" : displacement.swept ? "DISPLACEMENT_CONFIRMED" : "WAITING_POI_TOUCH" : sweep ? "SWEPT" : pools.length ? "LIQUIDITY_FOUND" : "SCANNING";
+  let direction = null;
+  let suggestedEntry = null;
+  let suggestedSl = null;
+  let suggestedTp = null;
+  if (poi) {
+    const isBull = poi.type === "OB_BULL" || poi.type === "FVG_BULL";
+    direction = isBull ? "BUY" : "SELL";
+    suggestedEntry = currentClose;
+    if (isBull) {
+      suggestedSl = poi.low - averageAtr * 0.2;
+      const slDistance = Math.abs(suggestedEntry - suggestedSl);
+      suggestedTp = suggestedEntry + slDistance * 2.5;
+    } else {
+      suggestedSl = poi.high + averageAtr * 0.2;
+      const slDistance = Math.abs(suggestedEntry - suggestedSl);
+      suggestedTp = suggestedEntry - slDistance * 2.5;
+    }
+  }
   const diagnostics = [
     `M15 trend ${trend ?? "UNKNOWN"}; daily ${dailyTrend ?? "UNKNOWN"}; H4 ${h4Trend ?? "UNKNOWN"}`,
     pools.length ? `${pools.length} liquidity pool${pools.length === 1 ? "" : "s"} detected` : "No equal-high/equal-low pool within 0.15 ATR14",
-    sweep ? `${sweep.type} sweep detected in latest M15 candle` : "Waiting for a valid liquidity sweep",
-    poi ? `${poi.type} created at M15 index ${poi.creationIndex}; expires after 50 bars` : "Waiting for displacement body > 1.5 ATR and internal break",
-    htfConflict ? "HTF conflict \u2014 risk must be reduced to 50%" : htfBias ? `HTF location ${htfBias}` : "HTF premium/discount not aligned",
-    state === "LTF_CONFIRM_M5" ? "M15 POI touched; waiting for M5 micro MSS confirmation" : "No executable confirmation yet"
+    sweep ? `${sweep.type} sweep detected` : "Waiting for a valid liquidity sweep",
+    poi ? `${poi.type} detected at bar ${poi.creationIndex}; expires after 50 bars` : "Waiting for displacement body > 1.2 ATR and internal break",
+    htfConflict ? "HTF conflict \u2014 risk reduced to 50%" : htfBias ? `HTF location ${htfBias}` : "HTF premium/discount not aligned",
+    `Setup Score: ${setupScore}/100 (${scoreAction})`,
+    state === "LTF_CONFIRM_M5" ? "M15 POI touched; M5 micro confirmation active" : "No executable confirmation yet"
   ];
   return {
     realSymbol,
@@ -33832,11 +34066,54 @@ async function analyzeSymbol(accountId, baseSymbol) {
     poiType: poi?.type ?? null,
     poiHigh: poi?.high ?? null,
     poiLow: poi?.low ?? null,
+    setupScore,
+    scoreAction,
+    direction,
+    suggestedEntry,
+    suggestedSl,
+    suggestedTp,
+    candleTimestamp: formingCandle.time,
     diagnostics,
     lastUpdated: (/* @__PURE__ */ new Date()).toISOString(),
     liquidityPool: pools,
     poi
   };
+}
+
+// src/lib/market.ts
+var NEWS_SYMBOLS = {
+  XAUUSD: ["USD"],
+  NAS100: ["USD"],
+  US30: ["USD"],
+  EURUSD: ["EUR", "USD"],
+  GBPUSD: ["GBP", "USD"]
+};
+function currenciesForSymbol(symbol) {
+  return NEWS_SYMBOLS[symbol] ?? ["USD"];
+}
+async function hasHighImpactNewsWithin(symbol, minutes) {
+  const token = process.env.FINNHUB_API_KEY;
+  if (!token) throw new Error("Add FINNHUB_API_KEY in Secrets");
+  const now = /* @__PURE__ */ new Date();
+  const end = new Date(now.getTime() + minutes * 6e4);
+  const from = now.toISOString().slice(0, 10);
+  const to = end.toISOString().slice(0, 10);
+  const response = await fetch(
+    `https://finnhub.io/api/v1/calendar/economic?from=${from}&to=${to}&token=${encodeURIComponent(token)}`
+  );
+  if (!response.ok) {
+    logger.warn({ status: response.status }, "Finnhub calendar request failed");
+    throw new Error("Finnhub news filter request failed");
+  }
+  const payload = await response.json();
+  const currencies = currenciesForSymbol(symbol);
+  const nowMs = now.getTime();
+  const windowMs = minutes * 6e4;
+  const event = (payload.economicCalendar ?? []).find((candidate) => {
+    const timeMs = candidate.time ? new Date(candidate.time).getTime() : NaN;
+    return candidate.impact?.toLowerCase() === "high" && currencies.includes(candidate.country ?? "") && Number.isFinite(timeMs) && Math.abs(timeMs - nowMs) <= windowMs;
+  });
+  return event ? { blocked: true, event: event.event ?? "High impact event" } : { blocked: false, event: null };
 }
 
 // src/lib/engine-scheduler.ts
@@ -33942,11 +34219,11 @@ async function patchJournalRow(row, patch) {
   });
   return true;
 }
-async function reconcileAccountJournal(accountId, metaApiAccountId, metadata = {}) {
+async function reconcileAccountJournal(profileId, metaApiAccountId, metadata = {}) {
   const live = await getLiveAccountSnapshot(metaApiAccountId, metadata);
   await supabaseRequest("profiles", {
     method: "PATCH",
-    query: { id: `eq.${accountId}` },
+    query: { id: `eq.${profileId}` },
     body: {
       balance: live.balance,
       equity: live.equity,
@@ -33956,13 +34233,13 @@ async function reconcileAccountJournal(accountId, metaApiAccountId, metadata = {
   if (live.balance !== null && live.equity !== null) {
     await supabaseRequest("equity_history", {
       method: "POST",
-      body: { account_id: accountId, balance: live.balance, equity: live.equity }
+      body: { account_id: profileId, balance: live.balance, equity: live.equity }
     });
   }
   const openRows = await supabaseRequest("journal", {
     query: {
       select: "*",
-      account_id: `eq.${accountId}`,
+      account_id: `eq.${profileId}`,
       status: "eq.OPEN",
       order: "created_at.asc",
       limit: 500
@@ -33974,7 +34251,7 @@ async function reconcileAccountJournal(accountId, metaApiAccountId, metadata = {
       deals = await getMetaApiHistoryDeals(metaApiAccountId);
     } catch (error) {
       logger.warn(
-        { accountId, metaApiAccountId, error },
+        { profileId, metaApiAccountId, error },
         "MetaApi history deals unavailable; open journal rows remain pending reconciliation"
       );
     }
@@ -33987,14 +34264,15 @@ async function reconcileAccountJournal(accountId, metaApiAccountId, metadata = {
     if (position) {
       if (shouldMoveToBreakEven(row, position) && position.id) {
         const entryPrice = numberValue(row.entry) ?? position.openPrice;
-        if (entryPrice === null) continue;
-        await moveMetaApiPositionStopToBreakEven({
-          accountId: metaApiAccountId,
-          positionId: position.id,
-          entryPrice,
-          takeProfit: position.takeProfit
-        });
-        breakEvenMoves += 1;
+        if (entryPrice !== null) {
+          await moveMetaApiPositionStopToBreakEven({
+            accountId: metaApiAccountId,
+            positionId: position.id,
+            entryPrice,
+            takeProfit: position.takeProfit
+          });
+          breakEvenMoves += 1;
+        }
       }
       const patch2 = {
         broker_position_id: row.broker_position_id ?? position.id,
@@ -34028,6 +34306,151 @@ async function reconcileAccountJournal(accountId, metaApiAccountId, metadata = {
   }
   return { account: live, updated, closed, breakEvenMoves };
 }
+async function checkIdempotency(profileId, symbol, candleTimestamp, direction) {
+  const existingRows = await supabaseRequest("journal", {
+    query: {
+      select: "*",
+      account_id: `eq.${profileId}`,
+      symbol: `eq.${symbol}`,
+      direction: `eq.${direction}`,
+      order: "created_at.desc",
+      limit: 20
+    }
+  });
+  const nowMs = new Date(candleTimestamp).getTime();
+  return existingRows.some((row) => {
+    if (row.status === "OPEN") return true;
+    const createdAtMs = new Date(String(row.created_at)).getTime();
+    return Math.abs(nowMs - createdAtMs) < 15 * 60 * 1e3;
+  });
+}
+async function evaluateAndAutoExecuteTrade(profileId, metaApiAccountId, symbol) {
+  if (isTradingHalted(profileId) || isTradingHalted(metaApiAccountId)) {
+    return;
+  }
+  const analysis = await analyzeSymbol(metaApiAccountId, symbol);
+  await supabaseRequest("states", {
+    method: "POST",
+    query: { on_conflict: "account_id,symbol" },
+    prefer: "resolution=merge-duplicates,return=representation",
+    body: {
+      account_id: profileId,
+      symbol,
+      current_state: analysis.currentState,
+      liquidity_pool: analysis.liquidityPool,
+      poi: analysis.poi,
+      diagnostics_log: analysis.diagnostics,
+      htf_bias: analysis.htfBias,
+      htf_conflict: analysis.htfConflict,
+      updated_at: analysis.lastUpdated
+    }
+  });
+  if (analysis.scoreAction === "REJECT" || analysis.setupScore < 55 || !analysis.direction || !analysis.suggestedSl || !analysis.suggestedTp) {
+    return;
+  }
+  if (await checkIdempotency(profileId, symbol, analysis.candleTimestamp, analysis.direction)) {
+    logger.info({ profileId, symbol, candleTimestamp: analysis.candleTimestamp }, "Autonomous trade skipped \u2014 idempotency block");
+    return;
+  }
+  const riskRows = await supabaseRequest("risk_settings", {
+    query: { select: "*", account_id: `eq.${profileId}`, limit: 1 }
+  });
+  const risk = riskRows[0] ?? {
+    risk_per_trade: 1,
+    daily_loss: 3,
+    weekly_loss: 6,
+    news_minutes: 30
+  };
+  const profile = await findProfile(profileId);
+  const live = await getLiveAccountSnapshot(metaApiAccountId, {
+    brokerName: typeof profile?.broker_name === "string" ? profile.broker_name : void 0,
+    server: typeof profile?.server === "string" ? profile.server : void 0
+  });
+  if (!live.connected || !live.leverage || !live.equity) {
+    return;
+  }
+  if (live.positions.some((pos) => pos.symbol === symbol)) {
+    return;
+  }
+  const day = /* @__PURE__ */ new Date();
+  if (day.getUTCDay() === 5 && (day.getUTCHours() > 21 || day.getUTCHours() === 21 && day.getUTCMinutes() >= 45)) {
+    return;
+  }
+  const news = await hasHighImpactNewsWithin(symbol, Number(risk.news_minutes ?? 30));
+  if (news.blocked) {
+    logger.info({ profileId, symbol, event: news.event }, "Autonomous trade blocked by high-impact news filter");
+    return;
+  }
+  const realSymbol = await resolveMetaApiSymbol(metaApiAccountId, symbol);
+  const [price, specification] = await Promise.all([
+    getMetaApiSymbolPrice(metaApiAccountId, realSymbol),
+    getMetaApiSymbolSpecification(metaApiAccountId, realSymbol)
+  ]);
+  if (!price.bid || !price.ask || !specification.tickSize || !specification.tickValue) {
+    return;
+  }
+  const entryPrice = analysis.direction === "BUY" ? price.ask : price.bid;
+  const slDistance = Math.abs(entryPrice - analysis.suggestedSl);
+  if (slDistance <= 0) return;
+  const maxConfiguredRiskPercent = Number(risk.risk_per_trade ?? 1);
+  const effectiveRiskPercent = analysis.scoreAction === "REDUCED_RISK" ? Math.min(maxConfiguredRiskPercent, maxConfiguredRiskPercent * 0.5) : maxConfiguredRiskPercent;
+  const lossPerLot = slDistance / specification.tickSize * specification.tickValue;
+  if (lossPerLot <= 0) return;
+  const monetaryRisk = live.equity * (effectiveRiskPercent / 100);
+  const volumeStep = specification.volumeStep ?? 0.01;
+  const rawLot = monetaryRisk / lossPerLot;
+  const lot = Math.floor(rawLot / volumeStep) * volumeStep;
+  if (lot < (specification.volumeMin ?? 0.01) || lot > (specification.volumeMax ?? 100)) {
+    logger.warn({ profileId, symbol, lot, min: specification.volumeMin }, "Autonomous trade lot size out of broker limits");
+    return;
+  }
+  const contractSize = specification.contractSize ?? 1e5;
+  const marginUsed = lot * contractSize * entryPrice / live.leverage;
+  if (live.freeMargin !== null && marginUsed > live.freeMargin || marginUsed > live.equity * 0.5) {
+    logger.warn({ profileId, symbol, marginUsed, freeMargin: live.freeMargin }, "Autonomous trade blocked by free margin protection");
+    return;
+  }
+  const orderResult = await executeMetaApiTrade({
+    accountId: metaApiAccountId,
+    actionType: analysis.direction === "BUY" ? "ORDER_TYPE_BUY" : "ORDER_TYPE_SELL",
+    symbol: realSymbol,
+    volume: lot,
+    stopLoss: analysis.suggestedSl,
+    takeProfit: analysis.suggestedTp
+  });
+  const brokerPositionId = typeof orderResult.positionId === "string" ? orderResult.positionId : null;
+  const brokerOrderId = typeof orderResult.orderId === "string" ? orderResult.orderId : null;
+  await supabaseRequest("journal", {
+    method: "POST",
+    prefer: "return=representation",
+    body: {
+      account_id: profileId,
+      symbol,
+      real_symbol: realSymbol,
+      direction: analysis.direction,
+      entry: entryPrice,
+      sl: analysis.suggestedSl,
+      initial_sl: analysis.suggestedSl,
+      tp: analysis.suggestedTp,
+      lot,
+      pnl: 0,
+      r_multiple: 0,
+      status: "OPEN",
+      broker_position_id: brokerPositionId,
+      broker_order_id: brokerOrderId,
+      broker_status: "OPEN",
+      poi_type: analysis.poiType,
+      bos_mss_tag: analysis.poi?.type,
+      htf_bias: analysis.htfBias,
+      leverage: live.leverage,
+      margin_used: marginUsed
+    }
+  });
+  logger.info(
+    { profileId, metaApiAccountId, symbol, direction: analysis.direction, lot, entry: entryPrice, setupScore: analysis.setupScore },
+    "Autonomous trade successfully executed"
+  );
+}
 async function runScheduledAnalysis() {
   if (running || !hasSupabaseConfig() || !process.env.METAAPI_TOKEN) return;
   running = true;
@@ -34042,27 +34465,15 @@ async function runScheduledAnalysis() {
         await Promise.all(
           SUPPORTED_SYMBOLS.map(async (symbol) => {
             try {
-              const result = await analyzeSymbol(profile.id, symbol);
-              await supabaseRequest("states", {
-                method: "POST",
-                query: { on_conflict: "account_id,symbol" },
-                prefer: "resolution=merge-duplicates,return=representation",
-                body: {
-                  account_id: profile.id,
-                  symbol,
-                  current_state: result.currentState,
-                  liquidity_pool: result.liquidityPool,
-                  poi: result.poi,
-                  diagnostics_log: result.diagnostics,
-                  htf_bias: result.htfBias,
-                  htf_conflict: result.htfConflict,
-                  updated_at: result.lastUpdated
-                }
-              });
+              await evaluateAndAutoExecuteTrade(
+                profile.id,
+                profile.metaapi_account_id,
+                symbol
+              );
             } catch (error) {
               logger.warn(
-                { accountId: profile.id, symbol, error },
-                "Scheduled strategy analysis failed"
+                { profileId: profile.id, symbol, error },
+                "Scheduled trade evaluation failed"
               );
             }
           })
@@ -34075,7 +34486,7 @@ async function runScheduledAnalysis() {
           if (result.updated || result.breakEvenMoves) {
             logger.info(
               {
-                accountId: profile.id,
+                profileId: profile.id,
                 updated: result.updated,
                 closed: result.closed,
                 breakEvenMoves: result.breakEvenMoves
@@ -34085,7 +34496,7 @@ async function runScheduledAnalysis() {
           }
         } catch (error) {
           logger.warn(
-            { accountId: profile.id, error },
+            { profileId: profile.id, error },
             "Broker journal reconciliation failed"
           );
         }
@@ -34166,9 +34577,9 @@ function emptySnapshot(diagnostics) {
     diagnostics
   };
 }
-router3.get("/dashboard", async (req, res) => {
+router3.get("/dashboard", requireAuth, requireAccountOwnership, async (req, res) => {
   try {
-    const { accountId } = GetDashboardQueryParams.parse(req.query);
+    const { accountId: profileId } = GetDashboardQueryParams.parse(req.query);
     if (!hasSupabaseConfig()) {
       res.json(
         emptySnapshot([
@@ -34178,32 +34589,33 @@ router3.get("/dashboard", async (req, res) => {
       );
       return;
     }
-    const profile = await findProfile(accountId);
-    if (!profile?.metaapi_account_id) {
+    const profile = await findProfile(profileId);
+    const metaApiAccountId = await resolveMetaApiAccountId(profileId);
+    if (!profile?.metaapi_account_id && !metaApiAccountId) {
       res.json(emptySnapshot(["No live broker account connected"]));
       return;
     }
     const reconciliation = await reconcileAccountJournal(
-      accountId,
-      String(profile.metaapi_account_id),
+      profileId,
+      metaApiAccountId,
       {
-        brokerName: typeof profile.broker_name === "string" ? profile.broker_name : void 0,
-        server: typeof profile.server === "string" ? profile.server : void 0
+        brokerName: typeof profile?.broker_name === "string" ? profile.broker_name : void 0,
+        server: typeof profile?.server === "string" ? profile.server : void 0
       }
     );
     const [account, states, journalRows, equityRows, riskRows] = await Promise.all([
       Promise.resolve(reconciliation.account),
       supabaseRequest("states", {
-        query: { select: "*", account_id: `eq.${accountId}`, order: "symbol.asc" }
+        query: { select: "*", account_id: `eq.${profileId}`, order: "symbol.asc" }
       }),
       supabaseRequest("journal", {
-        query: { select: "*", account_id: `eq.${accountId}`, order: "created_at.desc", limit: 100 }
+        query: { select: "*", account_id: `eq.${profileId}`, order: "created_at.desc", limit: 100 }
       }),
       supabaseRequest("equity_history", {
-        query: { select: "timestamp,balance,equity", account_id: `eq.${accountId}`, order: "timestamp.asc", limit: 500 }
+        query: { select: "timestamp,balance,equity", account_id: `eq.${profileId}`, order: "timestamp.asc", limit: 500 }
       }),
       supabaseRequest("risk_settings", {
-        query: { select: "*", account_id: `eq.${accountId}`, limit: 1 }
+        query: { select: "*", account_id: `eq.${profileId}`, limit: 1 }
       })
     ]);
     const journal = journalRows.map(mapJournal);
@@ -34227,7 +34639,7 @@ router3.get("/dashboard", async (req, res) => {
         equity: Number(row.equity ?? 0)
       })),
       risk: riskRows[0] ? {
-        accountId,
+        accountId: profileId,
         riskPerTrade: Number(riskRows[0].risk_per_trade ?? 1),
         dailyLoss: Number(riskRows[0].daily_loss ?? 3),
         weeklyLoss: Number(riskRows[0].weekly_loss ?? 6),
@@ -34249,18 +34661,6 @@ var dashboard_default = router3;
 var import_express4 = __toESM(require_express2(), 1);
 
 // src/lib/backtest.ts
-function averageAtr(candles, end, period = 14) {
-  const start = Math.max(1, end - period + 1);
-  const ranges = candles.slice(start, end + 1).map((candle, offset) => {
-    const previous = candles[start + offset - 1]?.close ?? candle.open;
-    return Math.max(
-      candle.high - candle.low,
-      Math.abs(candle.high - previous),
-      Math.abs(candle.low - previous)
-    );
-  });
-  return ranges.length ? ranges.reduce((sum, value) => sum + value, 0) / ranges.length : 0;
-}
 function floorVolume(value, specification) {
   if (specification.volumeMin === null || specification.volumeMax === null || specification.volumeStep === null) {
     return null;
@@ -34277,31 +34677,56 @@ function runBacktest(input) {
   let balance = input.startingBalance;
   let peak = balance;
   let maxDrawdown = 0;
-  let index = 20;
+  let index = 30;
   while (index < candles.length - 1) {
-    const candle = candles[index];
-    const lookback = candles.slice(index - 10, index);
-    const previousHigh = Math.max(...lookback.map((item) => item.high));
-    const previousLow = Math.min(...lookback.map((item) => item.low));
-    const atr2 = averageAtr(candles, index);
-    if (atr2 <= 0) {
+    const historicalWindow = candles.slice(0, index + 1);
+    const closedCandles = historicalWindow.slice(0, -1);
+    const currentCandle = historicalWindow[historicalWindow.length - 1];
+    const averageAtr = atr(closedCandles);
+    if (averageAtr <= 0) {
       index += 1;
       continue;
     }
-    const buySignal = candle.low <= previousLow && candle.close > previousLow;
-    const sellSignal = candle.high >= previousHigh && candle.close < previousHigh;
-    if (!buySignal && !sellSignal) {
+    const externalSwings = detectSwings(closedCandles, 10);
+    const internalSwings = detectSwings(closedCandles, 5);
+    const trend = calculateTrend(externalSwings);
+    const pools = findPools(closedCandles, externalSwings, averageAtr);
+    const sweep = pools.find((pool) => {
+      const candle = closedCandles[closedCandles.length - 1];
+      return pool.type === "BSL" ? candle.high >= pool.avgPrice + averageAtr * 0.15 && candle.close < pool.avgPrice : candle.low <= pool.avgPrice - averageAtr * 0.15 && candle.close > pool.avgPrice;
+    });
+    const displacement = inferPoi(closedCandles, internalSwings, pools, averageAtr);
+    const { score: setupScore, action: scoreAction } = calculateSetupScore({
+      htfBias: trend,
+      htfConflict: false,
+      sweep: sweep ?? null,
+      displacement,
+      trend,
+      m5Confirmed: true
+    });
+    if (scoreAction === "REJECT" || setupScore < 55 || !displacement.poi) {
       index += 1;
       continue;
     }
-    const direction = buySignal ? "BUY" : "SELL";
+    const poi = displacement.poi;
+    const isBull = poi.type === "OB_BULL" || poi.type === "FVG_BULL";
+    const direction = isBull ? "BUY" : "SELL";
     const spread = input.spreadPoints * specification.tickSize;
     const slippage = input.slippagePoints * specification.tickSize;
-    const entry = direction === "BUY" ? candle.close + spread / 2 + slippage : candle.close - spread / 2 - slippage;
-    const sl = direction === "BUY" ? candle.low - atr2 * 0.2 : candle.high + atr2 * 0.2;
+    const entry = direction === "BUY" ? currentCandle.close + spread / 2 + slippage : currentCandle.close - spread / 2 - slippage;
+    const sl = direction === "BUY" ? poi.low - averageAtr * 0.2 : poi.high + averageAtr * 0.2;
     const riskDistance = Math.abs(entry - sl);
+    if (riskDistance <= 0) {
+      index += 1;
+      continue;
+    }
     const lossPerLot = riskDistance / specification.tickSize * specification.tickValue;
-    const riskMoney = balance * (input.riskPerTrade / 100);
+    if (lossPerLot <= 0) {
+      index += 1;
+      continue;
+    }
+    const effectiveRiskPercent = scoreAction === "REDUCED_RISK" ? Math.min(input.riskPerTrade, input.riskPerTrade * 0.5) : input.riskPerTrade;
+    const riskMoney = balance * (effectiveRiskPercent / 100);
     const lot = floorVolume(riskMoney / lossPerLot, specification);
     if (!lot) {
       index += 1;
@@ -34332,7 +34757,7 @@ function runBacktest(input) {
     }
     trades.push({
       direction,
-      entryTime: candle.time,
+      entryTime: currentCandle.time,
       exitTime,
       entry,
       exit,
@@ -34363,42 +34788,6 @@ function runBacktest(input) {
   };
 }
 
-// src/lib/market.ts
-var NEWS_SYMBOLS = {
-  XAUUSD: ["USD"],
-  NAS100: ["USD"],
-  US30: ["USD"],
-  EURUSD: ["EUR", "USD"],
-  GBPUSD: ["GBP", "USD"]
-};
-function currenciesForSymbol(symbol) {
-  return NEWS_SYMBOLS[symbol] ?? ["USD"];
-}
-async function hasHighImpactNewsWithin(symbol, minutes) {
-  const token = process.env.FINNHUB_API_KEY;
-  if (!token) throw new Error("Add FINNHUB_API_KEY in Secrets");
-  const now = /* @__PURE__ */ new Date();
-  const end = new Date(now.getTime() + minutes * 6e4);
-  const from = now.toISOString().slice(0, 10);
-  const to = end.toISOString().slice(0, 10);
-  const response = await fetch(
-    `https://finnhub.io/api/v1/calendar/economic?from=${from}&to=${to}&token=${encodeURIComponent(token)}`
-  );
-  if (!response.ok) {
-    logger.warn({ status: response.status }, "Finnhub calendar request failed");
-    throw new Error("Finnhub news filter request failed");
-  }
-  const payload = await response.json();
-  const currencies = currenciesForSymbol(symbol);
-  const nowMs = now.getTime();
-  const windowMs = minutes * 6e4;
-  const event = (payload.economicCalendar ?? []).find((candidate) => {
-    const timeMs = candidate.time ? new Date(candidate.time).getTime() : NaN;
-    return candidate.impact?.toLowerCase() === "high" && currencies.includes(candidate.country ?? "") && Number.isFinite(timeMs) && Math.abs(timeMs - nowMs) <= windowMs;
-  });
-  return event ? { blocked: true, event: event.event ?? "High impact event" } : { blocked: false, event: null };
-}
-
 // src/routes/engine.ts
 var router4 = (0, import_express4.Router)();
 function errorMessage2(error) {
@@ -34421,27 +34810,29 @@ function mapState2(row) {
     lastUpdated: typeof row.updated_at === "string" ? row.updated_at : null
   };
 }
-async function loadStates(accountId) {
+async function loadStates(profileId) {
   const rows = await supabaseRequest("states", {
     query: {
       select: "*",
-      account_id: `eq.${accountId}`,
+      account_id: `eq.${profileId}`,
       order: "symbol.asc"
     }
   });
   return rows.map(mapState2);
 }
-router4.get("/engine/states", async (req, res) => {
+router4.get("/engine/states", requireAuth, requireAccountOwnership, async (req, res) => {
   try {
-    const { accountId } = GetEngineStatesQueryParams.parse(req.query);
-    res.json(await loadStates(accountId));
+    const { accountId: profileId } = GetEngineStatesQueryParams.parse(req.query);
+    res.json(await loadStates(profileId));
   } catch (error) {
     res.status(400).json({ error: errorMessage2(error) });
   }
 });
-router4.post("/engine/run", async (req, res) => {
+router4.post("/engine/run", requireAuth, requireAccountOwnership, async (req, res) => {
   try {
     const input = RunEngineBody.parse(req.body);
+    const profileId = input.accountId;
+    const metaApiAccountId = await resolveMetaApiAccountId(profileId);
     const symbols = input.symbols.filter(
       (symbol) => SUPPORTED_SYMBOLS.includes(symbol)
     );
@@ -34452,13 +34843,13 @@ router4.post("/engine/run", async (req, res) => {
     const results = await Promise.all(
       symbols.map(async (symbol) => {
         try {
-          const result = await analyzeSymbol(input.accountId, symbol);
+          const result = await analyzeSymbol(metaApiAccountId, symbol);
           await supabaseRequest("states", {
             method: "POST",
             query: { on_conflict: "account_id,symbol" },
             prefer: "resolution=merge-duplicates,return=representation",
             body: {
-              account_id: input.accountId,
+              account_id: profileId,
               symbol,
               current_state: result.currentState,
               liquidity_pool: result.liquidityPool,
@@ -34470,7 +34861,7 @@ router4.post("/engine/run", async (req, res) => {
             }
           });
           return {
-            accountId: input.accountId,
+            accountId: profileId,
             symbol,
             currentState: result.currentState,
             htfBias: result.htfBias,
@@ -34484,7 +34875,7 @@ router4.post("/engine/run", async (req, res) => {
           };
         } catch (error) {
           return {
-            accountId: input.accountId,
+            accountId: profileId,
             symbol,
             currentState: "SCANNING",
             htfBias: null,
@@ -34505,9 +34896,9 @@ router4.post("/engine/run", async (req, res) => {
     res.status(message.startsWith("Add ") ? 400 : 502).json({ error: message });
   }
 });
-router4.post("/engine/backtest", async (req, res) => {
+router4.post("/engine/backtest", requireAuth, requireAccountOwnership, async (req, res) => {
   try {
-    const accountId = String(req.body?.accountId ?? "").trim();
+    const profileId = String(req.body?.accountId ?? "").trim();
     const symbol = String(req.body?.symbol ?? "").trim().toUpperCase();
     const timeframe = String(req.body?.timeframe ?? "5m").trim();
     const startTime = String(req.body?.startTime ?? "").trim();
@@ -34517,7 +34908,7 @@ router4.post("/engine/backtest", async (req, res) => {
     const spreadPoints = Number(req.body?.spreadPoints);
     const slippagePoints = Number(req.body?.slippagePoints);
     const commissionPerLot = Number(req.body?.commissionPerLot);
-    if (!accountId || !symbol || !startTime || !endTime || !Number.isFinite(startingBalance) || startingBalance <= 0 || !Number.isFinite(riskPerTrade) || riskPerTrade <= 0 || !Number.isFinite(spreadPoints) || spreadPoints < 0 || !Number.isFinite(slippagePoints) || slippagePoints < 0 || !Number.isFinite(commissionPerLot) || commissionPerLot < 0) {
+    if (!profileId || !symbol || !startTime || !endTime || !Number.isFinite(startingBalance) || startingBalance <= 0 || !Number.isFinite(riskPerTrade) || riskPerTrade <= 0 || !Number.isFinite(spreadPoints) || spreadPoints < 0 || !Number.isFinite(slippagePoints) || slippagePoints < 0 || !Number.isFinite(commissionPerLot) || commissionPerLot < 0) {
       res.status(400).json({ error: "Complete backtest inputs are required; spread, slippage, and commission must be explicit" });
       return;
     }
@@ -34525,10 +34916,11 @@ router4.post("/engine/backtest", async (req, res) => {
       res.status(400).json({ error: "Unsupported backtest timeframe" });
       return;
     }
-    const realSymbol = await resolveMetaApiSymbol(accountId, symbol);
+    const metaApiAccountId = await resolveMetaApiAccountId(profileId);
+    const realSymbol = await resolveMetaApiSymbol(metaApiAccountId, symbol);
     const [candles, specification] = await Promise.all([
-      getHistoricalCandles(accountId, realSymbol, timeframe, 5e3, { startTime, endTime }),
-      getMetaApiSymbolSpecification(accountId, realSymbol)
+      getHistoricalCandles(metaApiAccountId, realSymbol, timeframe, 5e3, { startTime, endTime }),
+      getMetaApiSymbolSpecification(metaApiAccountId, realSymbol)
     ]);
     if (candles.length < 21) {
       res.status(409).json({ error: "Not enough real historical candles returned by MetaApi" });
@@ -34555,7 +34947,7 @@ router4.post("/engine/backtest", async (req, res) => {
     res.status(message.startsWith("Add ") ? 400 : 502).json({ error: message });
   }
 });
-async function tradeGate(accountId, symbol, risk, positions) {
+async function tradeGate(profileId, symbol, risk, positions) {
   const diagnostics = [];
   if (positions.some((position) => position.symbol === symbol)) {
     diagnostics.push("Duplicate symbol blocked");
@@ -34575,7 +34967,7 @@ async function tradeGate(accountId, symbol, risk, positions) {
   const journalRows = await supabaseRequest("journal", {
     query: {
       select: "pnl,status,created_at",
-      account_id: `eq.${accountId}`,
+      account_id: `eq.${profileId}`,
       status: "eq.CLOSED",
       order: "created_at.desc",
       limit: 500
@@ -34598,12 +34990,14 @@ async function tradeGate(accountId, symbol, risk, positions) {
   if (news.blocked) diagnostics.push(`High-impact news blocked: ${news.event}`);
   return diagnostics;
 }
-router4.post("/engine/execute", async (req, res) => {
+router4.post("/engine/execute", requireAuth, requireAccountOwnership, async (req, res) => {
   try {
     const input = ExecuteTradeBody.parse(req.body);
-    const profile = await findProfile(input.accountId);
+    const profileId = input.accountId;
+    const profile = await findProfile(profileId);
+    const metaApiAccountId = await resolveMetaApiAccountId(profileId);
     const riskRows = await supabaseRequest("risk_settings", {
-      query: { select: "*", account_id: `eq.${input.accountId}`, limit: 1 }
+      query: { select: "*", account_id: `eq.${profileId}`, limit: 1 }
     });
     const risk = riskRows[0] ?? {
       risk_per_trade: 1,
@@ -34611,11 +35005,11 @@ router4.post("/engine/execute", async (req, res) => {
       weekly_loss: 6,
       news_minutes: 30
     };
-    const live = await getLiveAccountSnapshot(input.accountId, {
+    const live = await getLiveAccountSnapshot(metaApiAccountId, {
       brokerName: typeof profile?.broker_name === "string" ? profile.broker_name : void 0,
       server: typeof profile?.server === "string" ? profile.server : void 0
     });
-    if (isTradingHalted(input.accountId)) {
+    if (isTradingHalted(profileId)) {
       res.status(409).json({ error: "Trading halted by emergency stop; reconnect and explicitly re-arm the account" });
       return;
     }
@@ -34624,7 +35018,7 @@ router4.post("/engine/execute", async (req, res) => {
       return;
     }
     const diagnostics = await tradeGate(
-      input.accountId,
+      profileId,
       input.symbol,
       { ...risk, __equity: live.equity },
       live.positions.filter(
@@ -34636,14 +35030,14 @@ router4.post("/engine/execute", async (req, res) => {
       return;
     }
     const realSymbol = await resolveMetaApiSymbol(
-      input.accountId,
+      metaApiAccountId,
       input.symbol,
       input.realSymbol
     );
     const [price, specification, candles] = await Promise.all([
-      getMetaApiSymbolPrice(input.accountId, realSymbol),
-      getMetaApiSymbolSpecification(input.accountId, realSymbol),
-      getHistoricalCandles(input.accountId, realSymbol, "15m", 40)
+      getMetaApiSymbolPrice(metaApiAccountId, realSymbol),
+      getMetaApiSymbolSpecification(metaApiAccountId, realSymbol),
+      getHistoricalCandles(metaApiAccountId, realSymbol, "15m", 40)
     ]);
     const tickTime = price.time ? new Date(price.time).getTime() : NaN;
     if (price.bid === null || price.ask === null || !Number.isFinite(tickTime) || Date.now() - tickTime > 3e4) {
@@ -34668,13 +35062,13 @@ router4.post("/engine/execute", async (req, res) => {
       return;
     }
     const last = candles.slice(0, -1).at(-1);
-    const averageAtr2 = candles.length > 15 ? candles.slice(-14).reduce((sum, candle) => sum + candle.high - candle.low, 0) / 14 : 0;
-    if (!last || averageAtr2 <= 0) {
+    const averageAtr = candles.length > 15 ? candles.slice(-14).reduce((sum, candle) => sum + candle.high - candle.low, 0) / 14 : 0;
+    if (!last || averageAtr <= 0) {
       res.status(409).json({ error: "Live candle data unavailable; order blocked" });
       return;
     }
     const slDistance = Math.abs(entryPrice - input.sl);
-    if (slDistance < averageAtr2 * 0.8 || slDistance > averageAtr2 * 2.5) {
+    if (slDistance < averageAtr * 0.8 || slDistance > averageAtr * 2.5) {
       res.status(409).json({ error: "SL distance must be between 0.8 ATR and 2.5 ATR" });
       return;
     }
@@ -34685,7 +35079,7 @@ router4.post("/engine/execute", async (req, res) => {
       return;
     }
     const spread = price.ask - price.bid;
-    const maxSpread = Math.max(specification.tickSize, averageAtr2 * 0.1) * Number(risk.spread_multiplier ?? 2.5);
+    const maxSpread = Math.max(specification.tickSize, averageAtr * 0.1) * Number(risk.spread_multiplier ?? 2.5);
     if (spread > maxSpread) {
       res.status(409).json({ error: "Current broker spread exceeds the configured protection threshold" });
       return;
@@ -34706,7 +35100,7 @@ router4.post("/engine/execute", async (req, res) => {
       return;
     }
     const result = await executeMetaApiTrade({
-      accountId: input.accountId,
+      accountId: metaApiAccountId,
       actionType: input.direction === "BUY" ? "ORDER_TYPE_BUY" : "ORDER_TYPE_SELL",
       symbol: realSymbol,
       volume: lot,
@@ -34719,7 +35113,7 @@ router4.post("/engine/execute", async (req, res) => {
       method: "POST",
       prefer: "return=representation",
       body: {
-        account_id: input.accountId,
+        account_id: profileId,
         symbol: input.symbol,
         real_symbol: realSymbol,
         direction: input.direction,
@@ -34744,7 +35138,7 @@ router4.post("/engine/execute", async (req, res) => {
     res.json({
       orderId,
       positionId: brokerPositionId,
-      accountId: input.accountId,
+      accountId: profileId,
       symbol: input.symbol,
       direction: input.direction,
       lot,
@@ -34789,24 +35183,25 @@ function mapJournal2(row) {
     createdAt: typeof row.created_at === "string" ? row.created_at : null
   };
 }
-router5.get("/journal", async (req, res) => {
+router5.get("/journal", requireAuth, requireAccountOwnership, async (req, res) => {
   try {
-    const { accountId } = GetJournalQueryParams.parse(req.query);
-    const profile = await findProfile(accountId);
-    if (typeof profile?.metaapi_account_id === "string") {
+    const { accountId: profileId } = GetJournalQueryParams.parse(req.query);
+    const profile = await findProfile(profileId);
+    const metaApiAccountId = await resolveMetaApiAccountId(profileId);
+    if (metaApiAccountId) {
       try {
-        await reconcileAccountJournal(accountId, profile.metaapi_account_id, {
-          brokerName: typeof profile.broker_name === "string" ? profile.broker_name : void 0,
-          server: typeof profile.server === "string" ? profile.server : void 0
+        await reconcileAccountJournal(profileId, metaApiAccountId, {
+          brokerName: typeof profile?.broker_name === "string" ? profile.broker_name : void 0,
+          server: typeof profile?.server === "string" ? profile.server : void 0
         });
       } catch (error) {
-        logger.warn({ accountId, error }, "Journal refresh reconciliation failed");
+        logger.warn({ profileId, error }, "Journal refresh reconciliation failed");
       }
     }
     const rows = await supabaseRequest("journal", {
       query: {
         select: "*",
-        account_id: `eq.${accountId}`,
+        account_id: `eq.${profileId}`,
         order: "created_at.desc",
         limit: 100
       }
@@ -34818,15 +35213,15 @@ router5.get("/journal", async (req, res) => {
     });
   }
 });
-router5.get("/equity-history", async (req, res) => {
+router5.get("/equity-history", requireAuth, requireAccountOwnership, async (req, res) => {
   try {
-    const { accountId } = GetEquityHistoryQueryParams.parse(req.query);
+    const { accountId: profileId } = GetEquityHistoryQueryParams.parse(req.query);
     const rows = await supabaseRequest(
       "equity_history",
       {
         query: {
           select: "timestamp,balance,equity",
-          account_id: `eq.${accountId}`,
+          account_id: `eq.${profileId}`,
           order: "timestamp.asc",
           limit: 500
         }
@@ -34860,29 +35255,29 @@ function mapRisk(row, accountId) {
     newsMinutes: Number(row.news_minutes ?? 30)
   };
 }
-router6.get("/risk-settings/:accountId", async (req, res) => {
+router6.get("/risk-settings/:accountId", requireAuth, requireAccountOwnership, async (req, res) => {
   try {
-    const { accountId } = GetRiskSettingsParams.parse(req.params);
+    const { accountId: profileId } = GetRiskSettingsParams.parse(req.params);
     const rows = await supabaseRequest("risk_settings", {
-      query: { select: "*", account_id: `eq.${accountId}`, limit: 1 }
+      query: { select: "*", account_id: `eq.${profileId}`, limit: 1 }
     });
-    res.json(mapRisk(rows[0] ?? {}, accountId));
+    res.json(mapRisk(rows[0] ?? {}, profileId));
   } catch (error) {
     res.status(400).json({
       error: error instanceof Error ? error.message : "Unable to load risk settings"
     });
   }
 });
-router6.patch("/risk-settings/:accountId", async (req, res) => {
+router6.patch("/risk-settings/:accountId", requireAuth, requireAccountOwnership, async (req, res) => {
   try {
-    const { accountId } = UpdateRiskSettingsParams.parse(req.params);
+    const { accountId: profileId } = UpdateRiskSettingsParams.parse(req.params);
     const input = UpdateRiskSettingsBody.parse(req.body);
     const rows = await supabaseRequest("risk_settings", {
       method: "POST",
       query: { on_conflict: "account_id" },
       prefer: "resolution=merge-duplicates,return=representation",
       body: {
-        account_id: accountId,
+        account_id: profileId,
         risk_per_trade: input.riskPerTrade,
         daily_loss: input.dailyLoss,
         weekly_loss: input.weeklyLoss,
@@ -34890,7 +35285,7 @@ router6.patch("/risk-settings/:accountId", async (req, res) => {
         news_minutes: input.newsMinutes
       }
     });
-    res.json(mapRisk(rows[0] ?? {}, accountId));
+    res.json(mapRisk(rows[0] ?? {}, profileId));
   } catch (error) {
     res.status(400).json({
       error: error instanceof Error ? error.message : "Unable to save risk settings"

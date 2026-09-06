@@ -147,10 +147,10 @@ function serverSuggestions(payload: unknown) {
     .slice(0, 10);
 }
 
-export async function getMetaApiAccount(accountId: string) {
+export async function getMetaApiAccount(metaApiAccountId: string) {
   return metaapiFetch<MetaApiAccount>(
     PROVISIONING_API,
-    `/users/current/accounts/${encodeURIComponent(accountId)}`,
+    `/users/current/accounts/${encodeURIComponent(metaApiAccountId)}`,
   );
 }
 
@@ -270,14 +270,14 @@ function mapPosition(position: MetaApiPosition) {
         : null;
   return {
     id: typeof position.id === "string" ? position.id : null,
-     symbol: typeof position.symbol === "string" ? position.symbol : null,
-     type: typeof position.type === "string" ? position.type : null,
+    symbol: typeof position.symbol === "string" ? position.symbol : null,
+    type: typeof position.type === "string" ? position.type : null,
     volume:
       typeof position.volume === "number"
         ? position.volume
         : typeof position.currentVolume === "number"
           ? position.currentVolume
-           : null,
+          : null,
     openPrice,
     currentPrice:
       typeof position.currentPrice === "number"
@@ -294,18 +294,18 @@ function mapPosition(position: MetaApiPosition) {
 }
 
 export async function getLiveAccountSnapshot(
-  accountId: string,
+  metaApiAccountId: string,
   metadata: { brokerName?: string; server?: string } = {},
 ) {
   const [account, info, rawPositions] = await Promise.all([
-    getMetaApiAccount(accountId),
+    getMetaApiAccount(metaApiAccountId),
     metaapiFetch<MetaApiAccountInfo>(
       CLIENT_API,
-      `/users/current/accounts/${encodeURIComponent(accountId)}/accountInformation`,
+      `/users/current/accounts/${encodeURIComponent(metaApiAccountId)}/accountInformation`,
     ),
     metaapiFetch<MetaApiPosition[]>(
       CLIENT_API,
-      `/users/current/accounts/${encodeURIComponent(accountId)}/positions`,
+      `/users/current/accounts/${encodeURIComponent(metaApiAccountId)}/positions`,
     ),
   ]);
   const leverage =
@@ -313,7 +313,7 @@ export async function getLiveAccountSnapshot(
       ? Math.round(info.leverage)
       : null;
   return {
-    accountId,
+    accountId: metaApiAccountId,
     brokerName: metadata.brokerName ?? null,
     server: metadata.server ?? account.server ?? null,
     accountType: account.type ?? null,
@@ -334,19 +334,19 @@ export async function getLiveAccountSnapshot(
   };
 }
 
-export async function getMetaApiSymbolInventory(accountId: string) {
+export async function getMetaApiSymbolInventory(metaApiAccountId: string) {
   return metaapiFetch<Array<Record<string, unknown>>>(
     CLIENT_API,
-    `/users/current/accounts/${encodeURIComponent(accountId)}/symbols`,
+    `/users/current/accounts/${encodeURIComponent(metaApiAccountId)}/symbols`,
   );
 }
 
 export async function resolveMetaApiSymbol(
-  accountId: string,
+  metaApiAccountId: string,
   displaySymbol: string,
   requestedSymbol?: string,
 ) {
-  const inventory = await getMetaApiSymbolInventory(accountId);
+  const inventory = await getMetaApiSymbolInventory(metaApiAccountId);
   const symbols = inventory
     .map((item) =>
       typeof item.symbol === "string"
@@ -385,10 +385,10 @@ export async function resolveMetaApiSymbol(
   return candidate;
 }
 
-export async function getMetaApiSymbolPrice(accountId: string, symbol: string) {
+export async function getMetaApiSymbolPrice(metaApiAccountId: string, symbol: string) {
   const raw = await metaapiFetch<Record<string, unknown>>(
     CLIENT_API,
-    `/users/current/accounts/${encodeURIComponent(accountId)}/symbols/${encodeURIComponent(symbol)}/price`,
+    `/users/current/accounts/${encodeURIComponent(metaApiAccountId)}/symbols/${encodeURIComponent(symbol)}/price`,
   );
   return {
     symbol,
@@ -405,12 +405,12 @@ export async function getMetaApiSymbolPrice(accountId: string, symbol: string) {
 }
 
 export async function getMetaApiSymbolSpecification(
-  accountId: string,
+  metaApiAccountId: string,
   symbol: string,
 ) {
   const raw = await metaapiFetch<Record<string, unknown>>(
     CLIENT_API,
-    `/users/current/accounts/${encodeURIComponent(accountId)}/symbols/${encodeURIComponent(symbol)}/specification`,
+    `/users/current/accounts/${encodeURIComponent(metaApiAccountId)}/symbols/${encodeURIComponent(symbol)}/specification`,
   );
   return {
     symbol,
@@ -428,7 +428,7 @@ export async function getMetaApiSymbolSpecification(
 }
 
 export async function getMetaApiHistoryDeals(
-  accountId: string,
+  metaApiAccountId: string,
   startTime = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000).toISOString(),
   endTime = new Date().toISOString(),
 ) {
@@ -436,7 +436,7 @@ export async function getMetaApiHistoryDeals(
     Array<Record<string, unknown>> | { deals?: Array<Record<string, unknown>> }
   >(
     CLIENT_API,
-    `/users/current/accounts/${encodeURIComponent(accountId)}/history-deals?startTime=${encodeURIComponent(startTime)}&endTime=${encodeURIComponent(endTime)}&limit=1000`,
+    `/users/current/accounts/${encodeURIComponent(metaApiAccountId)}/history-deals?startTime=${encodeURIComponent(startTime)}&endTime=${encodeURIComponent(endTime)}&limit=1000`,
   );
   const deals = Array.isArray(raw) ? raw : raw.deals ?? [];
   return deals.map((deal): MetaApiHistoryDeal => ({
@@ -511,15 +511,20 @@ export async function moveMetaApiPositionStopToBreakEven(input: {
   );
 }
 
-export async function closeAllMetaApiPositions(accountId: string, positions: Array<{ id: string | null }>) {
-  haltTrading(accountId);
+export async function closeAllMetaApiPositions(
+  metaApiAccountId: string,
+  positions: Array<{ id: string | null }>,
+  profileId?: string,
+) {
+  haltTrading(metaApiAccountId);
+  if (profileId) haltTrading(profileId);
   const closable = positions.filter((position): position is { id: string } => Boolean(position.id));
   const outcomes = await Promise.all(
     closable.map(async (position) => {
       try {
         await metaapiFetch(
           CLIENT_API,
-          `/users/current/accounts/${encodeURIComponent(accountId)}/trade`,
+          `/users/current/accounts/${encodeURIComponent(metaApiAccountId)}/trade`,
           {
             method: "POST",
             body: JSON.stringify({
@@ -541,11 +546,14 @@ export async function closeAllMetaApiPositions(accountId: string, positions: Arr
   );
   let remaining: string[] = [];
   try {
-    const verified = await getLiveAccountSnapshot(accountId);
+    const verified = await getLiveAccountSnapshot(metaApiAccountId);
     remaining = verified.positions
       .map((position) => position.id)
       .filter((id): id is string => Boolean(id));
-    if (!remaining.length) clearTradingHalt(accountId);
+    if (!remaining.length) {
+      clearTradingHalt(metaApiAccountId);
+      if (profileId) clearTradingHalt(profileId);
+    }
   } catch {
     // Keep the halt active when flatness cannot be verified.
   }
@@ -554,20 +562,21 @@ export async function closeAllMetaApiPositions(accountId: string, positions: Arr
     closed: outcomes.filter((outcome) => outcome.ok).length,
     failed: outcomes.filter((outcome) => !outcome.ok),
     remaining,
-    halted: isTradingHalted(accountId),
+    halted: isTradingHalted(metaApiAccountId) || (profileId ? isTradingHalted(profileId) : false),
   };
 }
 
-export async function disconnectMetaApiAccount(accountId: string) {
+export async function disconnectMetaApiAccount(metaApiAccountId: string, profileId?: string) {
   await metaapiFetch(
     PROVISIONING_API,
-    `/users/current/accounts/${encodeURIComponent(accountId)}/undeploy`,
+    `/users/current/accounts/${encodeURIComponent(metaApiAccountId)}/undeploy`,
     { method: "POST" },
   );
-  const status = await getMetaApiAccount(accountId);
-  clearTradingHalt(accountId);
+  const status = await getMetaApiAccount(metaApiAccountId);
+  clearTradingHalt(metaApiAccountId);
+  if (profileId) clearTradingHalt(profileId);
   return {
-    accountId,
+    accountId: metaApiAccountId,
     state: status.state ?? null,
     connectionStatus: status.connectionStatus ?? null,
     connected: status.state === "DEPLOYED" && status.connectionStatus === "CONNECTED",
@@ -584,7 +593,7 @@ export type Candle = {
 };
 
 export async function getHistoricalCandles(
-  accountId: string,
+  metaApiAccountId: string,
   symbol: string,
   timeframe = "15m",
   limit = 240,
@@ -598,7 +607,7 @@ export async function getHistoricalCandles(
     Array<Record<string, unknown>> | { candles?: Array<Record<string, unknown>> }
   >(
     CLIENT_API,
-    `/users/current/accounts/${encodeURIComponent(accountId)}/historical-candles/${encodeURIComponent(symbol)}?timeframe=${encodeURIComponent(timeframe)}&startTime=${encodeURIComponent(startTime)}&endTime=${encodeURIComponent(endTime)}&limit=${limit}`,
+    `/users/current/accounts/${encodeURIComponent(metaApiAccountId)}/historical-candles/${encodeURIComponent(symbol)}?timeframe=${encodeURIComponent(timeframe)}&startTime=${encodeURIComponent(startTime)}&endTime=${encodeURIComponent(endTime)}&limit=${limit}`,
   );
   const candles = Array.isArray(raw) ? raw : raw.candles ?? [];
   return candles
