@@ -50,6 +50,7 @@ function findLivePosition(
   }
 
   const candidates = positions.filter((position) => {
+    const activeSymbol = String(row.real_symbol || row.symbol || "").toUpperCase();
     if (
       position.symbol !== (row.real_symbol || row.symbol) ||
       !position.type ||
@@ -59,11 +60,16 @@ function findLivePosition(
     }
     const entry = numberValue(row.entry);
     const lot = numberValue(row.lot);
+    const priceTolerance = activeSymbol.includes("XAU") || activeSymbol.includes("GOLD")
+      ? 0.5
+      : activeSymbol.includes("US30") || activeSymbol.includes("NAS") || activeSymbol.includes("US100") || activeSymbol.includes("DJ30")
+        ? 5.0
+        : 0.0005;
     return (
       entry !== null &&
       position.openPrice !== null &&
       position.volume !== null &&
-      Math.abs(position.openPrice - entry) < 0.0005 &&
+      Math.abs(position.openPrice - entry) < priceTolerance &&
       (lot === null || Math.abs(position.volume - lot) < 0.000001)
     );
   });

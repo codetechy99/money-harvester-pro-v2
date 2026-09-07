@@ -28198,7 +28198,7 @@ var require_pino = __commonJS({
     function pinoBundlerAbsolutePath(p) {
       try {
         const path = __require("path");
-        const outputDir = "/home/runner/workspace/artifacts/api-server/dist";
+        const outputDir = "/app/artifacts/api-server/dist";
         return path.resolve(outputDir, p.replace(/^\.\//, ""));
       } catch (e) {
         const f = new Function("p", "return new URL(p, import.meta.url).pathname");
@@ -33811,8 +33811,9 @@ async function analyzeSymbol(accountId, baseSymbol) {
   const htfBias = dailyTrend === "BULLISH" && current.close <= equilibrium ? "BULLISH_DISCOUNT" : dailyTrend === "BEARISH" && current.close >= equilibrium ? "BEARISH_PREMIUM" : dailyTrend ?? null;
   const htfConflict = dailyTrend === "BULLISH" && h4Trend === "BEARISH" || dailyTrend === "BEARISH" && h4Trend === "BULLISH";
   const poi = displacement.poi;
+  const poiCreationTime = poi && m15[poi.creationIndex] ? m15[poi.creationIndex].time : null;
   const poiTouched = poi && m5.some(
-    (candle) => candle.time > m15[m15.length - 1].time && candle.high >= poi.low && candle.low <= poi.high
+    (candle) => (poiCreationTime ? candle.time >= poiCreationTime : candle.time > m15[m15.length - 1].time) && candle.high >= poi.low && candle.low <= poi.high
   );
   const state = poi ? poiTouched ? "LTF_CONFIRM_M5" : displacement.swept ? "DISPLACEMENT_CONFIRMED" : "WAITING_POI_TOUCH" : sweep ? "SWEPT" : pools.length ? "LIQUIDITY_FOUND" : "SCANNING";
   const diagnostics = [
@@ -33860,12 +33861,14 @@ function findLivePosition(row, positions) {
     return positions.find((position) => position.id === row.broker_position_id);
   }
   const candidates = positions.filter((position) => {
+    const activeSymbol = String(row.real_symbol || row.symbol || "").toUpperCase();
     if (position.symbol !== (row.real_symbol || row.symbol) || !position.type || !directionMatches(row.direction, position.type)) {
       return false;
     }
     const entry = numberValue(row.entry);
     const lot = numberValue(row.lot);
-    return entry !== null && position.openPrice !== null && position.volume !== null && Math.abs(position.openPrice - entry) < 5e-4 && (lot === null || Math.abs(position.volume - lot) < 1e-6);
+    const priceTolerance = activeSymbol.includes("XAU") || activeSymbol.includes("GOLD") ? 0.5 : activeSymbol.includes("US30") || activeSymbol.includes("NAS") || activeSymbol.includes("US100") || activeSymbol.includes("DJ30") ? 5 : 5e-4;
+    return entry !== null && position.openPrice !== null && position.volume !== null && Math.abs(position.openPrice - entry) < priceTolerance && (lot === null || Math.abs(position.volume - lot) < 1e-6);
   });
   return candidates.length === 1 ? candidates[0] : void 0;
 }
@@ -34675,29 +34678,41 @@ router4.post("/engine/execute", async (req, res) => {
     }
     const slDistance = Math.abs(entryPrice - input.sl);
     if (slDistance < averageAtr2 * 0.8 || slDistance > averageAtr2 * 2.5) {
-      res.status(409).json({ error: "SL distance must be between 0.8 ATR and 2.5 ATR" });
+      res.status(409).json({
+        error: `SL distance (${slDistance.toFixed(5)}) must be between 0.8 ATR (${(averageAtr2 * 0.8).toFixed(5)}) and 2.5 ATR (${(averageAtr2 * 2.5).toFixed(5)})`
+      });
       return;
     }
     const tpDistance = Math.abs(input.tp - entryPrice);
     const rewardRisk = tpDistance / slDistance;
     if (rewardRisk < 2 || rewardRisk > 3) {
-      res.status(409).json({ error: "TP must target a 1:2 to 1:3 risk-to-reward ratio" });
+      res.status(409).json({
+        error: `TP must target a 1:2 to 1:3 risk-to-reward ratio (current ratio: 1:${rewardRisk.toFixed(2)})`
+      });
       return;
     }
     const spread = price.ask - price.bid;
     const maxSpread = Math.max(specification.tickSize, averageAtr2 * 0.1) * Number(risk.spread_multiplier ?? 2.5);
     if (spread > maxSpread) {
-      res.status(409).json({ error: "Current broker spread exceeds the configured protection threshold" });
+      res.status(409).json({
+        error: `Current broker spread (${spread.toFixed(5)}) exceeds maximum allowed threshold (${maxSpread.toFixed(5)})`
+      });
       return;
     }
     const riskPercent = Number(risk.risk_per_trade ?? 1) / 100;
     const lossPerLot = slDistance / specification.tickSize * specification.tickValue;
     const requestedLot = live.equity * riskPercent / lossPerLot;
     const volumeStep = specification.volumeStep;
-    const floorLot = (value) => Math.floor(value / volumeStep) * volumeStep;
+    const floorLot = (value) => {
+      const steps = Math.floor(Math.round(value / volumeStep * 1e8) / 1e8);
+      const decimals = (volumeStep.toString().split(".")[1] || "").length;
+      return Number((steps * volumeStep).toFixed(decimals));
+    };
     const lot = floorLot(Math.min(input.lot, requestedLot, specification.volumeMax));
     if (lot < specification.volumeMin) {
-      res.status(409).json({ error: "Broker minimum volume would exceed the configured risk" });
+      res.status(409).json({
+        error: `Calculated lot (${lot}) is below broker minimum volume (${specification.volumeMin}); requested risk (${(riskPercent * 100).toFixed(1)}%) allows max lot ${requestedLot.toFixed(2)}`
+      });
       return;
     }
     const marginUsed = lot * specification.contractSize * entryPrice / live.leverage;
