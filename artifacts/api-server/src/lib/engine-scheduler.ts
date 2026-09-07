@@ -1,12 +1,21 @@
 import { logger } from "./logger";
 import {
+  getHistoricalCandles,
   getLiveAccountSnapshot,
   getMetaApiHistoryDeals,
+  getMetaApiSymbolPrice,
+  getMetaApiSymbolSpecification,
   moveMetaApiPositionStopToBreakEven,
+  resolveMetaApiSymbol,
   type MetaApiHistoryDeal,
 } from "./metaapi";
-import { analyzeSymbol, SUPPORTED_SYMBOLS } from "./strategy";
-import { hasSupabaseConfig, supabaseRequest } from "./supabase";
+import {
+  analyzeSymbol,
+  evaluateTradeRisk,
+  runPostExecutionPipeline,
+  SUPPORTED_SYMBOLS,
+} from "./strategy";
+import { findProfile, hasSupabaseConfig, supabaseRequest } from "./supabase";
 
 let running = false;
 let schedulerTimer: ReturnType<typeof setInterval> | undefined;
@@ -311,10 +320,83 @@ async function runScheduledAnalysis() {
                     updated_at: result.lastUpdated,
                   },
                 });
+
+                // Automated execution trigger check if state is EXECUTABLE and M1 micro confirmation is satisfied
+                if (result.currentState === "EXECUTABLE" && result.m1Triggered && result.poi) {
+                  const dbProfile = await findProfile(profile.id);
+                  const riskRows = await supabaseRequest<Record<string, unknown>[]>("risk_settings", {
+                    query: { select: "*", account_id: `eq.${profile.id}`, limit: 1 },
+                  });
+                  const risk = riskRows[0] ?? {};
+                  const live = await getLiveAccountSnapshot(profile.metaapi_account_id);
+                  const realSymbol = result.realSymbol;
+                  const [price, spec, candles] = await Promise.all([
+                    getMetaApiSymbolPrice(profile.metaapi_account_id, realSymbol),
+                    getMetaApiSymbolSpecification(profile.metaapi_account_id, realSymbol),
+                    getHistoricalCandles(profile.metaapi_account_id, realSymbol, "15m", 40),
+                  ]);
+
+                  const direction: "BUY" | "SELL" = result.m1Direction ?? (result.poi.type === "OB_BULL" ? "BUY" : "SELL");
+                  const entryPrice = direction === "BUY" ? price.ask : price.bid;
+
+                  if (entryPrice !== null) {
+                    const sl = direction === "BUY" ? result.poi.low : result.poi.high;
+                    const slDist = Math.abs(entryPrice - sl);
+                    const tp = direction === "BUY" ? entryPrice + slDist * 2.5 : entryPrice - slDist * 2.5;
+
+                    const riskEval = await evaluateTradeRisk({
+                      accountId: profile.id,
+                      symbol,
+                      realSymbol,
+                      direction,
+                      entryPrice,
+                      sl,
+                      tp,
+                      profileMetrics: {
+                        startingBalance: Number(dbProfile?.starting_balance ?? dbProfile?.balance ?? live.balance),
+                        highestEquity: Number(dbProfile?.highest_equity ?? live.equity),
+                        dailyStartingEquity: Number(dbProfile?.daily_starting_equity ?? live.equity),
+                        maxDrawdownPct: Number(dbProfile?.max_drawdown_pct ?? 10),
+                        dailyDrawdownPct: Number(dbProfile?.daily_drawdown_pct ?? 5),
+                      },
+                      riskSettings: {
+                        riskPerTrade: Number(risk.risk_per_trade ?? 1),
+                        dailyLoss: Number(risk.daily_loss ?? 3),
+                        weeklyLoss: Number(risk.weekly_loss ?? 6),
+                        spreadMultiplier: Number(risk.spread_multiplier ?? 2.5),
+                        newsMinutes: Number(risk.news_minutes ?? 30),
+                      },
+                      liveAccount: live,
+                      symbolSpec: spec,
+                      symbolPrice: price,
+                      recentCandles: candles,
+                    });
+
+                    if (riskEval.approved && riskEval.calculatedLot && riskEval.marginUsed) {
+                      await runPostExecutionPipeline({
+                        accountId: profile.id,
+                        symbol,
+                        realSymbol,
+                        direction,
+                        entryPrice,
+                        sl,
+                        tp,
+                        lot: riskEval.calculatedLot,
+                        poiType: result.poi.type,
+                        bosMssTag: "AUTOMATED_M1_TRIGGER",
+                        leverage: live.leverage!,
+                        marginUsed: riskEval.marginUsed,
+                      });
+                      logger.info({ accountId: profile.id, symbol }, "Automated M1 trade execution completed successfully");
+                    } else {
+                      logger.info({ accountId: profile.id, symbol, reason: riskEval.reason }, "Automated trade risk evaluation rejected candidate setup");
+                    }
+                  }
+                }
               } catch (error) {
                 logger.warn(
                   { accountId: profile.id, symbol, error },
-                  "Scheduled strategy analysis failed",
+                  "Scheduled strategy pass failed",
                 );
               }
             }),
