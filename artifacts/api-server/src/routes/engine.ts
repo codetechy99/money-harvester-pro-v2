@@ -362,31 +362,42 @@ router.post("/engine/execute", async (req, res) => {
     }
     const slDistance = Math.abs(entryPrice - input.sl);
     if (slDistance < averageAtr * 0.8 || slDistance > averageAtr * 2.5) {
-      res.status(409).json({ error: "SL distance must be between 0.8 ATR and 2.5 ATR" });
+      res.status(409).json({
+        error: `SL distance (${slDistance.toFixed(5)}) must be between 0.8 ATR (${(averageAtr * 0.8).toFixed(5)}) and 2.5 ATR (${(averageAtr * 2.5).toFixed(5)})`,
+      });
       return;
     }
     const tpDistance = Math.abs(input.tp - entryPrice);
     const rewardRisk = tpDistance / slDistance;
     if (rewardRisk < 2 || rewardRisk > 3) {
-      res.status(409).json({ error: "TP must target a 1:2 to 1:3 risk-to-reward ratio" });
+      res.status(409).json({
+        error: `TP must target a 1:2 to 1:3 risk-to-reward ratio (current ratio: 1:${rewardRisk.toFixed(2)})`,
+      });
       return;
     }
     const spread = price.ask - price.bid;
     const maxSpread = Math.max(specification.tickSize, averageAtr * 0.1) *
       Number(risk.spread_multiplier ?? 2.5);
     if (spread > maxSpread) {
-      res.status(409).json({ error: "Current broker spread exceeds the configured protection threshold" });
+      res.status(409).json({
+        error: `Current broker spread (${spread.toFixed(5)}) exceeds maximum allowed threshold (${maxSpread.toFixed(5)})`,
+      });
       return;
     }
     const riskPercent = Number(risk.risk_per_trade ?? 1) / 100;
     const lossPerLot = (slDistance / specification.tickSize) * specification.tickValue;
     const requestedLot = (live.equity * riskPercent) / lossPerLot;
     const volumeStep = specification.volumeStep;
-    const floorLot = (value: number) =>
-      Math.floor(value / volumeStep) * volumeStep;
+    const floorLot = (value: number) => {
+      const steps = Math.floor(Math.round((value / volumeStep) * 1e8) / 1e8);
+      const decimals = (volumeStep.toString().split(".")[1] || "").length;
+      return Number((steps * volumeStep).toFixed(decimals));
+    };
     const lot = floorLot(Math.min(input.lot, requestedLot, specification.volumeMax));
     if (lot < specification.volumeMin) {
-      res.status(409).json({ error: "Broker minimum volume would exceed the configured risk" });
+      res.status(409).json({
+        error: `Calculated lot (${lot}) is below broker minimum volume (${specification.volumeMin}); requested risk (${(riskPercent * 100).toFixed(1)}%) allows max lot ${requestedLot.toFixed(2)}`,
+      });
       return;
     }
     const marginUsed = (lot * specification.contractSize * entryPrice) / live.leverage;

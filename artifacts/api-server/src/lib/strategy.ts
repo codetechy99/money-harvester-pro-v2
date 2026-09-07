@@ -249,11 +249,15 @@ export async function analyzeSymbol(accountId: string, baseSymbol: string) {
     (dailyTrend === "BULLISH" && h4Trend === "BEARISH") ||
     (dailyTrend === "BEARISH" && h4Trend === "BULLISH");
   const poi = displacement.poi;
+  const poiCreationTime =
+    poi && m15[poi.creationIndex] ? m15[poi.creationIndex].time : null;
   const poiTouched =
     poi &&
     m5.some(
       (candle) =>
-        candle.time > m15[m15.length - 1].time &&
+        (poiCreationTime
+          ? candle.time >= poiCreationTime
+          : candle.time > m15[m15.length - 1].time) &&
         candle.high >= poi.low &&
         candle.low <= poi.high,
     );
