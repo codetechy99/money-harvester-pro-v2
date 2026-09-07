@@ -122,34 +122,45 @@ export async function evaluateTradeRisk(input: RiskCheckInput): Promise<RiskChec
     violations.push("Friday 21:45 GMT session cutoff — no new positions allowed before weekend");
   }
 
-  // 7. Wire Prop Account Protection Gate
+  // 7. Strictly Fail-Closed PROP Account Protection Gate
   try {
     const profile = await findProfile(accountId);
     if (profile) {
       const mode: AccountProfileMode = (typeof profile.mode === "string" ? profile.mode : "DEMO") as AccountProfileMode;
       if (mode === "PROP") {
-        const accountProfile: AccountProfile = {
-          id: accountId,
-          mode: "PROP",
-          startingBalance: typeof profile.starting_balance === "number" ? profile.starting_balance : 100000,
-          currentBalance: balance,
-          currentEquity: equity,
-          highestEquity: typeof profile.highest_equity === "number" ? profile.highest_equity : Math.max(equity, profile.starting_balance as number ?? 100000),
-          dailyStartingEquity: typeof profile.daily_starting_equity === "number" ? profile.daily_starting_equity : balance,
-          propRules: getDefaultPropRules(typeof profile.starting_balance === "number" ? profile.starting_balance : 100000),
-        };
+        const startingBalance = Number(profile.starting_balance);
+        const highestEquity = Number(profile.highest_equity ?? Math.max(equity, startingBalance));
+        const dailyStartingEquity = Number(profile.daily_starting_equity ?? balance);
 
-        const propSafety = evaluatePropSafety(accountProfile, totalOpenLot);
-        if (propSafety.isViolated) {
-          violations.push(propSafety.violationReason ?? "Prop account rule violated");
-        } else if (propSafety.isDefensive) {
-          warnings.push("PROP Account approaching risk limit (defensive posture active); trade risk reduced by 50%");
-          riskMultiplier *= 0.5;
+        if (!Number.isFinite(startingBalance) || startingBalance <= 0 ||
+            !Number.isFinite(highestEquity) || highestEquity <= 0 ||
+            !Number.isFinite(dailyStartingEquity) || dailyStartingEquity <= 0) {
+          violations.push("Fail-Closed: PROP safety evaluation unavailable due to invalid equity metrics");
+        } else {
+          const accountProfile: AccountProfile = {
+            id: accountId,
+            mode: "PROP",
+            startingBalance,
+            currentBalance: balance,
+            currentEquity: equity,
+            highestEquity,
+            dailyStartingEquity,
+            propRules: getDefaultPropRules(startingBalance),
+          };
+
+          const propSafety = evaluatePropSafety(accountProfile, totalOpenLot);
+          if (propSafety.isViolated) {
+            violations.push(propSafety.violationReason ?? "Prop account rule violated");
+          } else if (propSafety.isDefensive) {
+            warnings.push("PROP Account approaching risk limit (defensive posture active); trade risk reduced by 50%");
+            riskMultiplier *= 0.5;
+          }
         }
       }
     }
   } catch (error) {
-    logger.warn({ accountId, error }, "Prop safety check warning in risk engine");
+    logger.error({ accountId, error }, "CRITICAL: Fail-Closed PROP safety evaluation exception");
+    violations.push("Fail-Closed: PROP safety evaluation unavailable");
   }
 
   // 8. Journal History Checks (Daily/Weekly Loss, Consecutive Losses, Symbol Cooldown)

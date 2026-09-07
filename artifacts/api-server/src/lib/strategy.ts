@@ -344,6 +344,69 @@ export function evaluateM5Confirmation(
   };
 }
 
+export function evaluateM1Trigger(
+  m1Candles: Candle[],
+  m15LastTime: string,
+  poi: Poi | null,
+  m5Confirmed: boolean,
+) {
+  if (!m1Candles || !m1Candles.length) {
+    // If M1 data is not provided or unavailable, fallback to M5 confirmation alignment so execution is not blocked due to missing M1 data unless M1 is supplied
+    return {
+      evaluated: false,
+      m1Triggered: m5Confirmed,
+      reason: "M1 data unavailable; fallback to M5 confirmation",
+      diagnostics: "M1 trigger evaluated: fallback to M5 confirmation",
+    };
+  }
+
+  if (!m5Confirmed) {
+    return {
+      evaluated: true,
+      m1Triggered: false,
+      reason: "M1 entry blocked: M5 confirmation required first",
+      diagnostics: "M1 trigger blocked: M5 micro confirmation absent",
+    };
+  }
+
+  const closedM1 = m1Candles.slice(0, -1);
+  if (!closedM1.length) {
+    return {
+      evaluated: true,
+      m1Triggered: false,
+      reason: "Insufficient closed M1 candles",
+      diagnostics: "M1 trigger skipped: waiting for closed M1 candle",
+    };
+  }
+
+  if (!poi) {
+    return {
+      evaluated: true,
+      m1Triggered: false,
+      reason: "No POI present",
+      diagnostics: "M1 trigger blocked: missing POI",
+    };
+  }
+
+  const isBull = poi.type === "OB_BULL" || poi.type === "FVG_BULL";
+  const recentM1 = closedM1.slice(-5);
+  const avgM1Atr = atr(closedM1, 10);
+
+  const hasM1Displacement = recentM1.some((c) => {
+    const body = Math.abs(c.close - c.open);
+    return isBull ? c.close > c.open && body >= avgM1Atr * 1.0 : c.close < c.open && body >= avgM1Atr * 1.0;
+  });
+
+  return {
+    evaluated: true,
+    m1Triggered: hasM1Displacement,
+    reason: hasM1Displacement ? "M1 micro-displacement entry trigger confirmed" : "M1 micro-displacement entry trigger absent",
+    diagnostics: hasM1Displacement
+      ? "M1 entry trigger confirmed on closed candle"
+      : "M1 entry trigger pending micro-displacement candle",
+  };
+}
+
 export function calculateSetupScore(input: {
   htfBias: string | null;
   htfConflict: boolean;
@@ -354,6 +417,7 @@ export function calculateSetupScore(input: {
   bosMssPresent?: boolean;
   trend?: string | null;
   m5Confirmed: boolean;
+  m1Triggered?: boolean;
 }): SetupScoreResult {
   const htfAlignment = input.htfConflict
     ? 0
@@ -371,6 +435,7 @@ export function calculateSetupScore(input: {
   const bosMss = bosMssPresent ? 15 : 0;
 
   const m5Confirmation = input.m5Confirmed ? 15 : 0;
+  const m1Triggered = input.m1Triggered ?? true; // Defaults to true if not explicitly supplied
 
   const score = htfAlignment + liquiditySweep + poiQuality + bosMss + m5Confirmation;
 
@@ -387,7 +452,8 @@ export function calculateSetupScore(input: {
     sweepDone &&
     bosMssPresent &&
     poiPresent &&
-    input.m5Confirmed;
+    input.m5Confirmed &&
+    m1Triggered;
 
   let action: SetupScoreResult["action"] = "REJECT";
   let direction: "BUY" | "SELL" | null = null;
@@ -439,10 +505,11 @@ export async function analyzeSymbol(accountId: string, baseSymbol: string) {
       // Missing symbol expected during suffix discovery
     }
   }
-  const [h4, daily, m5] = await Promise.all([
+  const [h4, daily, m5, m1] = await Promise.all([
     getHistoricalCandles(accountId, realSymbol, "4h", 120),
     getHistoricalCandles(accountId, realSymbol, "1d", 60),
     getHistoricalCandles(accountId, realSymbol, "5m", 80),
+    getHistoricalCandles(accountId, realSymbol, "1m", 120).catch(() => []),
   ]);
 
   if (m15.length < 40) {
@@ -515,7 +582,10 @@ export async function analyzeSymbol(accountId: string, baseSymbol: string) {
     poi.touched = m5Eval.poiTouched;
   }
 
-  // 6. Setup Score Calculation
+  // 6. M1 Entry Trigger Evaluation
+  const m1Eval = evaluateM1Trigger(m1, lastM15Time, poi, m5Eval.m5Confirmed);
+
+  // 7. Setup Score Calculation
   const isLiquiditySwept = pools.some((p) => p.swept);
   const setupScoreObj = calculateSetupScore({
     htfBias,
@@ -524,14 +594,15 @@ export async function analyzeSymbol(accountId: string, baseSymbol: string) {
     poiPresent: Boolean(poi),
     bosMssPresent: bosMssResult.detected,
     m5Confirmed: m5Eval.m5Confirmed,
+    m1Triggered: m1Eval.m1Triggered,
     displacement: poi ? { poi, swept: isLiquiditySwept } : undefined,
     trend,
   });
 
-  // 7. State Machine
+  // 8. State Machine
   let state = "SCANNING";
   if (poi) {
-    if (m5Eval.m5Confirmed) {
+    if (m5Eval.m5Confirmed && m1Eval.m1Triggered) {
       state = "LTF_CONFIRM_M5";
     } else if (m5Eval.poiTouched) {
       state = "WAITING_POI_TOUCH";
@@ -586,6 +657,7 @@ export async function analyzeSymbol(accountId: string, baseSymbol: string) {
         ? `HTF location ${htfBias}`
         : "HTF premium/discount not aligned",
     m5Eval.diagnostics,
+    m1Eval.diagnostics,
     `Setup Score: ${setupScoreObj.score}/100 (${setupScoreObj.action})`,
   ];
 

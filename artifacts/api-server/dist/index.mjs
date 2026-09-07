@@ -33901,6 +33901,54 @@ function evaluateM5Confirmation(m5Candles, m15LastTime, poi) {
     diagnostics: microConfirmed ? "M5 confirmation evaluated: micro MSS/displacement confirmed" : "M5 confirmation evaluated: POI touched, awaiting micro displacement"
   };
 }
+function evaluateM1Trigger(m1Candles, m15LastTime, poi, m5Confirmed) {
+  if (!m1Candles || !m1Candles.length) {
+    return {
+      evaluated: false,
+      m1Triggered: m5Confirmed,
+      reason: "M1 data unavailable; fallback to M5 confirmation",
+      diagnostics: "M1 trigger evaluated: fallback to M5 confirmation"
+    };
+  }
+  if (!m5Confirmed) {
+    return {
+      evaluated: true,
+      m1Triggered: false,
+      reason: "M1 entry blocked: M5 confirmation required first",
+      diagnostics: "M1 trigger blocked: M5 micro confirmation absent"
+    };
+  }
+  const closedM1 = m1Candles.slice(0, -1);
+  if (!closedM1.length) {
+    return {
+      evaluated: true,
+      m1Triggered: false,
+      reason: "Insufficient closed M1 candles",
+      diagnostics: "M1 trigger skipped: waiting for closed M1 candle"
+    };
+  }
+  if (!poi) {
+    return {
+      evaluated: true,
+      m1Triggered: false,
+      reason: "No POI present",
+      diagnostics: "M1 trigger blocked: missing POI"
+    };
+  }
+  const isBull = poi.type === "OB_BULL" || poi.type === "FVG_BULL";
+  const recentM1 = closedM1.slice(-5);
+  const avgM1Atr = atr(closedM1, 10);
+  const hasM1Displacement = recentM1.some((c) => {
+    const body = Math.abs(c.close - c.open);
+    return isBull ? c.close > c.open && body >= avgM1Atr * 1 : c.close < c.open && body >= avgM1Atr * 1;
+  });
+  return {
+    evaluated: true,
+    m1Triggered: hasM1Displacement,
+    reason: hasM1Displacement ? "M1 micro-displacement entry trigger confirmed" : "M1 micro-displacement entry trigger absent",
+    diagnostics: hasM1Displacement ? "M1 entry trigger confirmed on closed candle" : "M1 entry trigger pending micro-displacement candle"
+  };
+}
 function calculateSetupScore(input) {
   const htfAlignment = input.htfConflict ? 0 : input.htfBias ? 25 : 0;
   const sweepDone = Boolean(input.liquiditySwept ?? input.sweep);
@@ -33910,13 +33958,14 @@ function calculateSetupScore(input) {
   const bosMssPresent = Boolean(input.bosMssPresent);
   const bosMss = bosMssPresent ? 15 : 0;
   const m5Confirmation = input.m5Confirmed ? 15 : 0;
+  const m1Triggered = input.m1Triggered ?? true;
   const score = htfAlignment + liquiditySweep + poiQuality + bosMss + m5Confirmation;
   const poiType = input.displacement?.poi?.type;
   let isBullish = poiType === "OB_BULL" || poiType === "FVG_BULL" || input.htfBias?.includes("BULLISH") || input.trend === "BULLISH";
   if (poiType === "OB_BEAR" || poiType === "FVG_BEAR" || input.htfBias?.includes("BEARISH") || input.trend === "BEARISH") {
     isBullish = false;
   }
-  const hasMandatoryConditions = !input.htfConflict && Boolean(input.htfBias) && sweepDone && bosMssPresent && poiPresent && input.m5Confirmed;
+  const hasMandatoryConditions = !input.htfConflict && Boolean(input.htfBias) && sweepDone && bosMssPresent && poiPresent && input.m5Confirmed && m1Triggered;
   let action = "REJECT";
   let direction = null;
   if (hasMandatoryConditions) {
@@ -33963,10 +34012,11 @@ async function analyzeSymbol(accountId, baseSymbol) {
     } catch {
     }
   }
-  const [h4, daily, m5] = await Promise.all([
+  const [h4, daily, m5, m1] = await Promise.all([
     getHistoricalCandles(accountId, realSymbol, "4h", 120),
     getHistoricalCandles(accountId, realSymbol, "1d", 60),
-    getHistoricalCandles(accountId, realSymbol, "5m", 80)
+    getHistoricalCandles(accountId, realSymbol, "5m", 80),
+    getHistoricalCandles(accountId, realSymbol, "1m", 120).catch(() => [])
   ]);
   if (m15.length < 40) {
     return {
@@ -34015,6 +34065,7 @@ async function analyzeSymbol(accountId, baseSymbol) {
   if (poi) {
     poi.touched = m5Eval.poiTouched;
   }
+  const m1Eval = evaluateM1Trigger(m1, lastM15Time, poi, m5Eval.m5Confirmed);
   const isLiquiditySwept = pools.some((p) => p.swept);
   const setupScoreObj = calculateSetupScore({
     htfBias,
@@ -34023,12 +34074,13 @@ async function analyzeSymbol(accountId, baseSymbol) {
     poiPresent: Boolean(poi),
     bosMssPresent: bosMssResult.detected,
     m5Confirmed: m5Eval.m5Confirmed,
+    m1Triggered: m1Eval.m1Triggered,
     displacement: poi ? { poi, swept: isLiquiditySwept } : void 0,
     trend
   });
   let state = "SCANNING";
   if (poi) {
-    if (m5Eval.m5Confirmed) {
+    if (m5Eval.m5Confirmed && m1Eval.m1Triggered) {
       state = "LTF_CONFIRM_M5";
     } else if (m5Eval.poiTouched) {
       state = "WAITING_POI_TOUCH";
@@ -34066,6 +34118,7 @@ async function analyzeSymbol(accountId, baseSymbol) {
     poi ? `${poi.type} created at M15 index ${poi.creationIndex}` : "Waiting for displacement body > 1.2 ATR and internal break",
     htfConflict ? "HTF conflict \u2014 risk must be reduced to 50%" : htfBias ? `HTF location ${htfBias}` : "HTF premium/discount not aligned",
     m5Eval.diagnostics,
+    m1Eval.diagnostics,
     `Setup Score: ${setupScoreObj.score}/100 (${setupScoreObj.action})`
   ];
   return {
@@ -34314,27 +34367,35 @@ async function evaluateTradeRisk(input) {
     if (profile) {
       const mode = typeof profile.mode === "string" ? profile.mode : "DEMO";
       if (mode === "PROP") {
-        const accountProfile = {
-          id: accountId,
-          mode: "PROP",
-          startingBalance: typeof profile.starting_balance === "number" ? profile.starting_balance : 1e5,
-          currentBalance: balance,
-          currentEquity: equity,
-          highestEquity: typeof profile.highest_equity === "number" ? profile.highest_equity : Math.max(equity, profile.starting_balance ?? 1e5),
-          dailyStartingEquity: typeof profile.daily_starting_equity === "number" ? profile.daily_starting_equity : balance,
-          propRules: getDefaultPropRules(typeof profile.starting_balance === "number" ? profile.starting_balance : 1e5)
-        };
-        const propSafety = evaluatePropSafety(accountProfile, totalOpenLot);
-        if (propSafety.isViolated) {
-          violations.push(propSafety.violationReason ?? "Prop account rule violated");
-        } else if (propSafety.isDefensive) {
-          warnings.push("PROP Account approaching risk limit (defensive posture active); trade risk reduced by 50%");
-          riskMultiplier *= 0.5;
+        const startingBalance = Number(profile.starting_balance);
+        const highestEquity = Number(profile.highest_equity ?? Math.max(equity, startingBalance));
+        const dailyStartingEquity = Number(profile.daily_starting_equity ?? balance);
+        if (!Number.isFinite(startingBalance) || startingBalance <= 0 || !Number.isFinite(highestEquity) || highestEquity <= 0 || !Number.isFinite(dailyStartingEquity) || dailyStartingEquity <= 0) {
+          violations.push("Fail-Closed: PROP safety evaluation unavailable due to invalid equity metrics");
+        } else {
+          const accountProfile = {
+            id: accountId,
+            mode: "PROP",
+            startingBalance,
+            currentBalance: balance,
+            currentEquity: equity,
+            highestEquity,
+            dailyStartingEquity,
+            propRules: getDefaultPropRules(startingBalance)
+          };
+          const propSafety = evaluatePropSafety(accountProfile, totalOpenLot);
+          if (propSafety.isViolated) {
+            violations.push(propSafety.violationReason ?? "Prop account rule violated");
+          } else if (propSafety.isDefensive) {
+            warnings.push("PROP Account approaching risk limit (defensive posture active); trade risk reduced by 50%");
+            riskMultiplier *= 0.5;
+          }
         }
       }
     }
   } catch (error) {
-    logger.warn({ accountId, error }, "Prop safety check warning in risk engine");
+    logger.error({ accountId, error }, "CRITICAL: Fail-Closed PROP safety evaluation exception");
+    violations.push("Fail-Closed: PROP safety evaluation unavailable");
   }
   try {
     const journalRows = await supabaseRequest("journal", {
