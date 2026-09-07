@@ -2,18 +2,21 @@ import { logger } from "./logger";
 import {
   getLiveAccountSnapshot,
   getMetaApiHistoryDeals,
+  getMetaApiSymbolPrice,
+  getMetaApiSymbolSpecification,
   moveMetaApiPositionStopToBreakEven,
+  resolveMetaApiSymbol,
   type MetaApiHistoryDeal,
 } from "./metaapi";
 import { analyzeSymbol, SUPPORTED_SYMBOLS } from "./strategy";
 import { hasSupabaseConfig, supabaseRequest, findProfile } from "./supabase";
 import {
   evaluatePropSafety,
-  evaluateContestMetrics,
   type AccountProfile,
   type AccountProfileMode,
 } from "./account-profile";
-import { hasHighImpactNewsWithin } from "./market";
+import { evaluateTradeRisk } from "./risk-engine";
+import { runPostExecutionPipeline } from "./execution-pipeline";
 
 let running = false;
 let schedulerTimer: ReturnType<typeof setInterval> | undefined;
@@ -441,6 +444,132 @@ export async function reconcileAccountJournal(
   return { account: live, updated, closed, breakEvenMoves };
 }
 
+export async function evaluateAndAutoExecuteTrade(
+  accountId: string,
+  metaApiAccountId: string,
+  symbol: string,
+) {
+  const cycleStatus = getAccountCycleStatus(accountId);
+  if (cycleStatus.state !== "ACTIVE") {
+    logger.info({ accountId, symbol, cycleState: cycleStatus.state }, "Auto-execution blocked by cycle state (must be ACTIVE)");
+    return;
+  }
+
+  const result = await analyzeSymbol(accountId, symbol);
+  if (
+    (result.scoreAction !== "STRONG_BUY" &&
+      result.scoreAction !== "BUY" &&
+      result.scoreAction !== "STRONG_SELL" &&
+      result.scoreAction !== "SELL") ||
+    !result.direction ||
+    result.suggestedSl === null ||
+    result.suggestedTp === null
+  ) {
+    return;
+  }
+
+  const live = await getLiveAccountSnapshot(metaApiAccountId);
+  if (!live.connected || !live.leverage || !live.equity || !live.balance) {
+    logger.warn({ accountId, symbol }, "Auto-execution blocked: live account unconnected or missing metrics");
+    return;
+  }
+
+  const realSymbol = await resolveMetaApiSymbol(metaApiAccountId, symbol, result.realSymbol);
+  const [price, specification] = await Promise.all([
+    getMetaApiSymbolPrice(metaApiAccountId, realSymbol),
+    getMetaApiSymbolSpecification(metaApiAccountId, realSymbol),
+  ]);
+
+  if (
+    price.bid === null ||
+    price.ask === null ||
+    specification.tickSize === null ||
+    specification.tickValue === null ||
+    specification.volumeMin === null ||
+    specification.volumeMax === null ||
+    specification.volumeStep === null
+  ) {
+    logger.warn({ accountId, symbol }, "Auto-execution blocked: invalid tick or volume specification");
+    return;
+  }
+
+  const riskRows = await supabaseRequest<Record<string, unknown>[]>("risk_settings", {
+    query: { select: "*", account_id: `eq.${accountId}`, limit: 1 },
+  });
+  const riskRow = riskRows[0] ?? {};
+  const riskSettings = {
+    riskPerTrade: Number(riskRow.risk_per_trade ?? 1),
+    dailyLoss: Number(riskRow.daily_loss ?? 3),
+    weeklyLoss: Number(riskRow.weekly_loss ?? 6),
+    spreadMultiplier: Number(riskRow.spread_multiplier ?? 2.5),
+    newsMinutes: Number(riskRow.news_minutes ?? 30),
+  };
+
+  const entryPrice = result.direction === "BUY" ? price.ask : price.bid;
+  const slDistance = Math.abs(entryPrice - result.suggestedSl);
+  const spread = price.ask - price.bid;
+  const maxSpread = Math.max(specification.tickSize, 0.0001) * riskSettings.spreadMultiplier;
+
+  const riskCheck = await evaluateTradeRisk({
+    accountId,
+    symbol,
+    direction: result.direction,
+    equity: live.equity,
+    balance: live.balance,
+    freeMargin: live.freeMargin,
+    openPositions: live.positions.map((p) => ({
+      id: p.id ?? undefined,
+      symbol: p.symbol ?? symbol,
+      volume: p.volume,
+      openPrice: p.openPrice,
+    })),
+    spreadInfo: {
+      currentSpread: spread,
+      maxAllowedSpread: maxSpread,
+    },
+    riskSettings,
+  });
+
+  if (!riskCheck.passed) {
+    logger.info({ accountId, symbol, violations: riskCheck.violations }, "Auto-execution blocked by authoritative risk check");
+    return;
+  }
+
+  const effectiveRiskPercent = (riskSettings.riskPerTrade / 100) * riskCheck.riskMultiplier;
+  const lossPerLot = (slDistance / specification.tickSize) * specification.tickValue;
+  if (lossPerLot <= 0) return;
+
+  const requestedLot = (live.equity * effectiveRiskPercent) / lossPerLot;
+  const volumeStep = specification.volumeStep;
+  const lot = Math.floor(Math.min(requestedLot, specification.volumeMax) / volumeStep) * volumeStep;
+
+  if (lot < specification.volumeMin) {
+    logger.info({ accountId, symbol, lot, volumeMin: specification.volumeMin }, "Auto-execution blocked: lot below volumeMin");
+    return;
+  }
+
+  const marginUsed = (lot * (specification.contractSize ?? 100000) * entryPrice) / live.leverage;
+
+  const pipelineResult = await runPostExecutionPipeline({
+    accountId,
+    symbol,
+    realSymbol,
+    direction: result.direction,
+    lot,
+    sl: result.suggestedSl,
+    tp: result.suggestedTp,
+    poiType: result.poiType ?? undefined,
+    bosMssTag: result.bosMssTag ?? undefined,
+    leverage: live.leverage,
+    marginUsed,
+  });
+
+  logger.info(
+    { accountId, symbol, direction: result.direction, lot, success: pipelineResult.success, slVerified: pipelineResult.slVerified, tpVerified: pipelineResult.tpVerified },
+    "Auto-execution pipeline completed",
+  );
+}
+
 async function runScheduledAnalysis() {
   if (running || !hasSupabaseConfig() || !process.env.METAAPI_TOKEN) return;
   running = true;
@@ -527,6 +656,11 @@ async function runScheduledAnalysis() {
                     updated_at: result.lastUpdated,
                   },
                 });
+
+                // Auto-execute if cycle state is ACTIVE
+                if (cycleStatus.state === "ACTIVE") {
+                  await evaluateAndAutoExecuteTrade(profile.id, profile.metaapi_account_id, symbol);
+                }
               } catch (error) {
                 logger.warn(
                   { accountId: profile.id, symbol, error },

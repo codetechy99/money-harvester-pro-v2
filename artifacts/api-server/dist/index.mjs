@@ -33274,6 +33274,22 @@ async function getMetaApiHistoryDeals(accountId, startTime = new Date(Date.now()
     time: typeof deal.time === "string" ? deal.time : typeof deal.executionTime === "string" ? deal.executionTime : typeof deal.time === "number" ? new Date(deal.time).toISOString() : typeof deal.executionTime === "number" ? new Date(deal.executionTime).toISOString() : null
   }));
 }
+async function modifyMetaApiPosition(input) {
+  return metaapiFetch(
+    CLIENT_API,
+    `/users/current/accounts/${encodeURIComponent(input.accountId)}/trade`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        actionType: "POSITION_MODIFY_ID",
+        positionId: input.positionId,
+        stopLoss: input.stopLoss,
+        takeProfit: input.takeProfit,
+        comment: "MH-V2 PROTECTION CORRECTION"
+      })
+    }
+  );
+}
 async function moveMetaApiPositionStopToBreakEven(input) {
   return metaapiFetch(
     CLIENT_API,
@@ -33886,12 +33902,13 @@ function evaluateM5Confirmation(m5Candles, m15LastTime, poi) {
   };
 }
 function calculateSetupScore(input) {
-  const htfAlignment = input.htfConflict ? 0 : input.htfBias ? 25 : 10;
-  const sweepDone = input.liquiditySwept ?? Boolean(input.sweep);
+  const htfAlignment = input.htfConflict ? 0 : input.htfBias ? 25 : 0;
+  const sweepDone = Boolean(input.liquiditySwept ?? input.sweep);
   const liquiditySweep = sweepDone ? 25 : 0;
-  const poiPresent = input.poiPresent ?? Boolean(input.displacement?.poi);
+  const poiPresent = Boolean(input.poiPresent ?? input.displacement?.poi);
   const poiQuality = poiPresent ? 20 : 0;
-  const bosMss = input.bosMssPresent ? 15 : 10;
+  const bosMssPresent = Boolean(input.bosMssPresent);
+  const bosMss = bosMssPresent ? 15 : 0;
   const m5Confirmation = input.m5Confirmed ? 15 : 0;
   const score = htfAlignment + liquiditySweep + poiQuality + bosMss + m5Confirmation;
   const poiType = input.displacement?.poi?.type;
@@ -33899,14 +33916,17 @@ function calculateSetupScore(input) {
   if (poiType === "OB_BEAR" || poiType === "FVG_BEAR" || input.htfBias?.includes("BEARISH") || input.trend === "BEARISH") {
     isBullish = false;
   }
+  const hasMandatoryConditions = !input.htfConflict && Boolean(input.htfBias) && sweepDone && bosMssPresent && poiPresent && input.m5Confirmed;
   let action = "REJECT";
   let direction = null;
-  if (score >= 80) {
-    action = isBullish ? "STRONG_BUY" : "STRONG_SELL";
-    direction = isBullish ? "BUY" : "SELL";
-  } else if (score >= 60) {
-    action = isBullish ? "BUY" : "SELL";
-    direction = isBullish ? "BUY" : "SELL";
+  if (hasMandatoryConditions) {
+    if (score >= 80) {
+      action = isBullish ? "STRONG_BUY" : "STRONG_SELL";
+      direction = isBullish ? "BUY" : "SELL";
+    } else if (score >= 60) {
+      action = isBullish ? "BUY" : "SELL";
+      direction = isBullish ? "BUY" : "SELL";
+    }
   }
   return {
     score,
@@ -34184,6 +34204,336 @@ function evaluateContestMetrics(profile, closedTrades = []) {
     maxDrawdownPercent,
     winRatePercent,
     objectiveProgressPercent
+  };
+}
+
+// src/lib/market.ts
+var NEWS_SYMBOLS = {
+  XAUUSD: ["USD"],
+  NAS100: ["USD"],
+  US30: ["USD"],
+  EURUSD: ["EUR", "USD"],
+  GBPUSD: ["GBP", "USD"]
+};
+function currenciesForSymbol(symbol) {
+  return NEWS_SYMBOLS[symbol] ?? ["USD"];
+}
+async function hasHighImpactNewsWithin(symbol, minutes) {
+  const token = process.env.FINNHUB_API_KEY;
+  if (!token) {
+    logger.warn("FINNHUB_API_KEY missing; skipping news blackout filter");
+    return { blocked: false, event: null, warning: "Missing FINNHUB_API_KEY" };
+  }
+  const now = /* @__PURE__ */ new Date();
+  const end = new Date(now.getTime() + minutes * 6e4);
+  const from = now.toISOString().slice(0, 10);
+  const to = end.toISOString().slice(0, 10);
+  try {
+    const response = await fetch(
+      `https://finnhub.io/api/v1/calendar/economic?from=${from}&to=${to}&token=${encodeURIComponent(token)}`
+    );
+    if (!response.ok) {
+      logger.warn({ status: response.status }, "Finnhub calendar request failed");
+      return { blocked: false, event: null, warning: "News service unavailable" };
+    }
+    const payload = await response.json();
+    const currencies = currenciesForSymbol(symbol);
+    const nowMs = now.getTime();
+    const windowMs = minutes * 6e4;
+    const event = (payload.economicCalendar ?? []).find((candidate) => {
+      const timeMs = candidate.time ? new Date(candidate.time).getTime() : NaN;
+      return candidate.impact?.toLowerCase() === "high" && currencies.includes(candidate.country ?? "") && Number.isFinite(timeMs) && Math.abs(timeMs - nowMs) <= windowMs;
+    });
+    return event ? { blocked: true, event: event.event ?? "High impact event" } : { blocked: false, event: null };
+  } catch (error) {
+    logger.warn({ error }, "Error querying Finnhub economic calendar");
+    return { blocked: false, event: null, warning: "News service error" };
+  }
+}
+
+// src/lib/risk-engine.ts
+async function evaluateTradeRisk(input) {
+  const violations = [];
+  const warnings = [];
+  let riskMultiplier = 1;
+  const {
+    accountId,
+    symbol,
+    equity,
+    balance,
+    openPositions,
+    spreadInfo,
+    riskSettings = {}
+  } = input;
+  if (!Number.isFinite(equity) || equity <= 0 || !Number.isFinite(balance) || balance <= 0) {
+    return {
+      passed: false,
+      violations: ["Fail-Closed: Live broker equity and balance must be valid positive numbers"],
+      warnings: [],
+      riskMultiplier: 0
+    };
+  }
+  const dailyLossLimitPct = riskSettings.dailyLoss ?? 3;
+  const weeklyLossLimitPct = riskSettings.weeklyLoss ?? 6;
+  const maxTotalExposure = riskSettings.maxTotalExposureLot ?? 5;
+  const maxSymbolExposure = riskSettings.maxSymbolExposureLot ?? 2;
+  const maxConcurrentPositions = riskSettings.maxConcurrentPositions ?? 5;
+  const consecutiveLossLimit = riskSettings.consecutiveLossLimit ?? 3;
+  const symbolCooldownMinutes = riskSettings.symbolCooldownMinutes ?? 15;
+  const newsMinutes = riskSettings.newsMinutes ?? 30;
+  const emergencyEquityFloor = riskSettings.emergencyEquityFloor ?? 0;
+  if (emergencyEquityFloor > 0 && equity <= emergencyEquityFloor) {
+    violations.push(`Account equity ($${equity.toFixed(2)}) is at or below emergency equity floor ($${emergencyEquityFloor.toFixed(2)})`);
+  }
+  const symbolOpenPositions = openPositions.filter((p) => p.symbol === symbol);
+  if (symbolOpenPositions.length > 0) {
+    violations.push(`Duplicate open position on symbol ${symbol} already exists`);
+  }
+  if (openPositions.length >= maxConcurrentPositions) {
+    violations.push(`Maximum concurrent positions limit (${maxConcurrentPositions}) reached`);
+  }
+  const totalOpenLot = openPositions.reduce((sum, p) => sum + (p.volume ?? 0), 0);
+  if (totalOpenLot >= maxTotalExposure) {
+    violations.push(`Maximum total exposure lot limit (${maxTotalExposure} lots) reached (current: ${totalOpenLot.toFixed(2)})`);
+  }
+  const symbolOpenLot = symbolOpenPositions.reduce((sum, p) => sum + (p.volume ?? 0), 0);
+  if (symbolOpenLot >= maxSymbolExposure) {
+    violations.push(`Maximum symbol exposure lot limit (${maxSymbolExposure} lots) reached on ${symbol}`);
+  }
+  if (spreadInfo) {
+    if (spreadInfo.currentSpread > spreadInfo.maxAllowedSpread) {
+      violations.push(`Current broker spread (${spreadInfo.currentSpread.toFixed(5)}) exceeds maximum allowed spread threshold (${spreadInfo.maxAllowedSpread.toFixed(5)})`);
+    }
+  }
+  const day = /* @__PURE__ */ new Date();
+  if (day.getUTCDay() === 5 && (day.getUTCHours() > 21 || day.getUTCHours() === 21 && day.getUTCMinutes() >= 45)) {
+    violations.push("Friday 21:45 GMT session cutoff \u2014 no new positions allowed before weekend");
+  }
+  try {
+    const profile = await findProfile(accountId);
+    if (profile) {
+      const mode = typeof profile.mode === "string" ? profile.mode : "DEMO";
+      if (mode === "PROP") {
+        const accountProfile = {
+          id: accountId,
+          mode: "PROP",
+          startingBalance: typeof profile.starting_balance === "number" ? profile.starting_balance : 1e5,
+          currentBalance: balance,
+          currentEquity: equity,
+          highestEquity: typeof profile.highest_equity === "number" ? profile.highest_equity : Math.max(equity, profile.starting_balance ?? 1e5),
+          dailyStartingEquity: typeof profile.daily_starting_equity === "number" ? profile.daily_starting_equity : balance,
+          propRules: getDefaultPropRules(typeof profile.starting_balance === "number" ? profile.starting_balance : 1e5)
+        };
+        const propSafety = evaluatePropSafety(accountProfile, totalOpenLot);
+        if (propSafety.isViolated) {
+          violations.push(propSafety.violationReason ?? "Prop account rule violated");
+        } else if (propSafety.isDefensive) {
+          warnings.push("PROP Account approaching risk limit (defensive posture active); trade risk reduced by 50%");
+          riskMultiplier *= 0.5;
+        }
+      }
+    }
+  } catch (error) {
+    logger.warn({ accountId, error }, "Prop safety check warning in risk engine");
+  }
+  try {
+    const journalRows = await supabaseRequest("journal", {
+      query: {
+        select: "symbol,pnl,status,created_at,closed_at",
+        account_id: `eq.${accountId}`,
+        status: "eq.CLOSED",
+        order: "closed_at.desc",
+        limit: 100
+      }
+    });
+    const now = Date.now();
+    const dayPnl = journalRows.filter((row) => now - new Date(String(row.closed_at ?? row.created_at ?? 0)).getTime() <= 864e5).reduce((sum, row) => sum + Number(row.pnl ?? 0), 0);
+    const weekPnl = journalRows.filter((row) => now - new Date(String(row.closed_at ?? row.created_at ?? 0)).getTime() <= 7 * 864e5).reduce((sum, row) => sum + Number(row.pnl ?? 0), 0);
+    const maxDailyLossAmount = equity * dailyLossLimitPct / 100;
+    if (dayPnl <= -maxDailyLossAmount) {
+      violations.push(`Daily loss limit reached ($${Math.abs(dayPnl).toFixed(2)} >= $${maxDailyLossAmount.toFixed(2)} max)`);
+    }
+    const maxWeeklyLossAmount = equity * weeklyLossLimitPct / 100;
+    if (weekPnl <= -maxWeeklyLossAmount) {
+      violations.push(`Weekly loss limit reached ($${Math.abs(weekPnl).toFixed(2)} >= $${maxWeeklyLossAmount.toFixed(2)} max)`);
+    }
+    const lastSymbolTrade = journalRows.find((row) => row.symbol === symbol);
+    if (lastSymbolTrade?.closed_at) {
+      const closedAtMs = new Date(String(lastSymbolTrade.closed_at)).getTime();
+      const elapsedMinutes = (now - closedAtMs) / (1e3 * 60);
+      if (elapsedMinutes < symbolCooldownMinutes) {
+        violations.push(`Symbol ${symbol} re-entry cooldown active (closed ${elapsedMinutes.toFixed(1)} mins ago, required: ${symbolCooldownMinutes} mins)`);
+      }
+    }
+    let consecutiveLosses = 0;
+    for (const row of journalRows) {
+      const pnl = Number(row.pnl ?? 0);
+      if (pnl < 0) {
+        consecutiveLosses += 1;
+      } else if (pnl > 0) {
+        break;
+      }
+    }
+    if (consecutiveLosses >= consecutiveLossLimit) {
+      warnings.push(`${consecutiveLosses} consecutive losses detected; reducing trade risk by 50%`);
+      riskMultiplier *= 0.5;
+    }
+  } catch (error) {
+    logger.warn({ accountId, error }, "Risk engine journal history check skipped due to query error");
+  }
+  try {
+    const news = await hasHighImpactNewsWithin(symbol, newsMinutes);
+    if (news.blocked) {
+      violations.push(`High-impact news event active: ${news.event}`);
+    }
+  } catch (error) {
+    logger.warn({ symbol, error }, "News filter check error in risk engine");
+  }
+  const passed = violations.length === 0;
+  if (!passed) {
+    riskMultiplier = 0;
+  }
+  return {
+    passed,
+    violations,
+    warnings,
+    riskMultiplier
+  };
+}
+
+// src/lib/execution-pipeline.ts
+function getPriceTolerance(symbol) {
+  const activeSymbol = symbol.toUpperCase();
+  return activeSymbol.includes("XAU") || activeSymbol.includes("GOLD") ? 0.5 : activeSymbol.includes("US30") || activeSymbol.includes("NAS") || activeSymbol.includes("US100") || activeSymbol.includes("DJ30") ? 5 : 5e-4;
+}
+async function runPostExecutionPipeline(input) {
+  const logs = [];
+  logs.push(`Initiating order request for ${input.symbol} (${input.direction} ${input.lot} lots)`);
+  let orderResult;
+  try {
+    orderResult = await executeMetaApiTrade({
+      accountId: input.accountId,
+      actionType: input.direction === "BUY" ? "ORDER_TYPE_BUY" : "ORDER_TYPE_SELL",
+      symbol: input.realSymbol ?? input.symbol,
+      volume: input.lot,
+      stopLoss: input.sl,
+      takeProfit: input.tp
+    });
+    logs.push(`Broker accepted order request (orderId: ${orderResult.orderId ?? "N/A"}, positionId: ${orderResult.positionId ?? "N/A"})`);
+  } catch (error) {
+    const err = error instanceof Error ? error.message : String(error);
+    logs.push(`Order request rejected by broker: ${err}`);
+    return {
+      success: false,
+      orderId: null,
+      positionId: null,
+      verifiedPosition: null,
+      slVerified: false,
+      tpVerified: false,
+      error: err,
+      logs
+    };
+  }
+  const orderId = typeof orderResult.orderId === "string" ? orderResult.orderId : null;
+  const initialPositionId = typeof orderResult.positionId === "string" ? orderResult.positionId : null;
+  let verifiedPosition = null;
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    try {
+      const snapshot = await getLiveAccountSnapshot(input.accountId);
+      const targetSymbol = input.realSymbol ?? input.symbol;
+      const matched = snapshot.positions.find((p) => {
+        if (initialPositionId && p.id === initialPositionId) return true;
+        return p.symbol === targetSymbol && Boolean(p.type?.toUpperCase().includes(input.direction)) && Math.abs((p.volume ?? 0) - input.lot) < 1e-4;
+      });
+      if (matched) {
+        verifiedPosition = matched;
+        logs.push(`Position verified on broker snapshot (Attempt ${attempt}): ID ${matched.id ?? "N/A"}`);
+        break;
+      }
+    } catch (err) {
+      logs.push(`Broker snapshot verification attempt ${attempt} warning: ${String(err)}`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+  if (!verifiedPosition) {
+    logs.push("CRITICAL: Order accepted but position not found in live account snapshot!");
+    return {
+      success: true,
+      // Order succeeded, but protection verification needs attention
+      orderId,
+      positionId: initialPositionId,
+      verifiedPosition: null,
+      slVerified: false,
+      tpVerified: false,
+      error: "Position registered but unverified on snapshot",
+      logs
+    };
+  }
+  const tolerance = getPriceTolerance(input.symbol);
+  let slVerified = verifiedPosition.stopLoss !== null && verifiedPosition.stopLoss !== void 0 && Math.abs(verifiedPosition.stopLoss - input.sl) <= tolerance;
+  let tpVerified = verifiedPosition.takeProfit !== null && verifiedPosition.takeProfit !== void 0 && Math.abs(verifiedPosition.takeProfit - input.tp) <= tolerance;
+  logs.push(`Protection Check -> SL attached: ${verifiedPosition.stopLoss ?? "NONE"} (Expected: ${input.sl}), TP attached: ${verifiedPosition.takeProfit ?? "NONE"} (Expected: ${input.tp})`);
+  if ((!slVerified || !tpVerified) && verifiedPosition.id) {
+    logs.push("UNPROTECTED POSITION DETECTED! Triggering emergency position protection modification...");
+    try {
+      await modifyMetaApiPosition({
+        accountId: input.accountId,
+        positionId: verifiedPosition.id,
+        stopLoss: input.sl,
+        takeProfit: input.tp
+      });
+      logs.push("Emergency protection correction request transmitted successfully");
+      const reSnapshot = await getLiveAccountSnapshot(input.accountId);
+      const reMatched = reSnapshot.positions.find((p) => p.id === verifiedPosition?.id);
+      if (reMatched) {
+        verifiedPosition = reMatched;
+        slVerified = reMatched.stopLoss !== null && reMatched.stopLoss !== void 0 && Math.abs(reMatched.stopLoss - input.sl) <= tolerance;
+        tpVerified = reMatched.takeProfit !== null && reMatched.takeProfit !== void 0 && Math.abs(reMatched.takeProfit - input.tp) <= tolerance;
+        logs.push(`Emergency Correction Verification -> SL: ${reMatched.stopLoss ?? "NONE"}, TP: ${reMatched.takeProfit ?? "NONE"}`);
+      }
+    } catch (err) {
+      logs.push(`CRITICAL: Emergency protection modification failed: ${String(err)}`);
+    }
+  }
+  try {
+    await supabaseRequest("journal", {
+      method: "POST",
+      prefer: "return=representation",
+      body: {
+        account_id: input.accountId,
+        symbol: input.symbol,
+        real_symbol: input.realSymbol ?? input.symbol,
+        direction: input.direction,
+        entry: verifiedPosition.openPrice ?? 0,
+        sl: verifiedPosition.stopLoss ?? input.sl,
+        initial_sl: input.sl,
+        tp: verifiedPosition.takeProfit ?? input.tp,
+        lot: input.lot,
+        pnl: 0,
+        r_multiple: 0,
+        status: "OPEN",
+        broker_position_id: verifiedPosition.id ?? initialPositionId,
+        broker_order_id: orderId,
+        broker_status: "OPEN",
+        poi_type: input.poiType ?? null,
+        bos_mss_tag: input.bosMssTag ?? null,
+        htf_bias: null,
+        leverage: input.leverage,
+        margin_used: input.marginUsed
+      }
+    });
+    logs.push("Position registered in persistent journal");
+  } catch (err) {
+    logs.push(`Journal registration warning: ${String(err)}`);
+  }
+  return {
+    success: true,
+    orderId,
+    positionId: verifiedPosition.id ?? initialPositionId,
+    verifiedPosition,
+    slVerified,
+    tpVerified,
+    logs
   };
 }
 
@@ -34495,6 +34845,97 @@ async function reconcileAccountJournal(accountId, metaApiAccountId, metadata = {
   }
   return { account: live, updated, closed, breakEvenMoves };
 }
+async function evaluateAndAutoExecuteTrade(accountId, metaApiAccountId, symbol) {
+  const cycleStatus = getAccountCycleStatus(accountId);
+  if (cycleStatus.state !== "ACTIVE") {
+    logger.info({ accountId, symbol, cycleState: cycleStatus.state }, "Auto-execution blocked by cycle state (must be ACTIVE)");
+    return;
+  }
+  const result = await analyzeSymbol(accountId, symbol);
+  if (result.scoreAction !== "STRONG_BUY" && result.scoreAction !== "BUY" && result.scoreAction !== "STRONG_SELL" && result.scoreAction !== "SELL" || !result.direction || result.suggestedSl === null || result.suggestedTp === null) {
+    return;
+  }
+  const live = await getLiveAccountSnapshot(metaApiAccountId);
+  if (!live.connected || !live.leverage || !live.equity || !live.balance) {
+    logger.warn({ accountId, symbol }, "Auto-execution blocked: live account unconnected or missing metrics");
+    return;
+  }
+  const realSymbol = await resolveMetaApiSymbol(metaApiAccountId, symbol, result.realSymbol);
+  const [price, specification] = await Promise.all([
+    getMetaApiSymbolPrice(metaApiAccountId, realSymbol),
+    getMetaApiSymbolSpecification(metaApiAccountId, realSymbol)
+  ]);
+  if (price.bid === null || price.ask === null || specification.tickSize === null || specification.tickValue === null || specification.volumeMin === null || specification.volumeMax === null || specification.volumeStep === null) {
+    logger.warn({ accountId, symbol }, "Auto-execution blocked: invalid tick or volume specification");
+    return;
+  }
+  const riskRows = await supabaseRequest("risk_settings", {
+    query: { select: "*", account_id: `eq.${accountId}`, limit: 1 }
+  });
+  const riskRow = riskRows[0] ?? {};
+  const riskSettings = {
+    riskPerTrade: Number(riskRow.risk_per_trade ?? 1),
+    dailyLoss: Number(riskRow.daily_loss ?? 3),
+    weeklyLoss: Number(riskRow.weekly_loss ?? 6),
+    spreadMultiplier: Number(riskRow.spread_multiplier ?? 2.5),
+    newsMinutes: Number(riskRow.news_minutes ?? 30)
+  };
+  const entryPrice = result.direction === "BUY" ? price.ask : price.bid;
+  const slDistance = Math.abs(entryPrice - result.suggestedSl);
+  const spread = price.ask - price.bid;
+  const maxSpread = Math.max(specification.tickSize, 1e-4) * riskSettings.spreadMultiplier;
+  const riskCheck = await evaluateTradeRisk({
+    accountId,
+    symbol,
+    direction: result.direction,
+    equity: live.equity,
+    balance: live.balance,
+    freeMargin: live.freeMargin,
+    openPositions: live.positions.map((p) => ({
+      id: p.id ?? void 0,
+      symbol: p.symbol ?? symbol,
+      volume: p.volume,
+      openPrice: p.openPrice
+    })),
+    spreadInfo: {
+      currentSpread: spread,
+      maxAllowedSpread: maxSpread
+    },
+    riskSettings
+  });
+  if (!riskCheck.passed) {
+    logger.info({ accountId, symbol, violations: riskCheck.violations }, "Auto-execution blocked by authoritative risk check");
+    return;
+  }
+  const effectiveRiskPercent = riskSettings.riskPerTrade / 100 * riskCheck.riskMultiplier;
+  const lossPerLot = slDistance / specification.tickSize * specification.tickValue;
+  if (lossPerLot <= 0) return;
+  const requestedLot = live.equity * effectiveRiskPercent / lossPerLot;
+  const volumeStep = specification.volumeStep;
+  const lot = Math.floor(Math.min(requestedLot, specification.volumeMax) / volumeStep) * volumeStep;
+  if (lot < specification.volumeMin) {
+    logger.info({ accountId, symbol, lot, volumeMin: specification.volumeMin }, "Auto-execution blocked: lot below volumeMin");
+    return;
+  }
+  const marginUsed = lot * (specification.contractSize ?? 1e5) * entryPrice / live.leverage;
+  const pipelineResult = await runPostExecutionPipeline({
+    accountId,
+    symbol,
+    realSymbol,
+    direction: result.direction,
+    lot,
+    sl: result.suggestedSl,
+    tp: result.suggestedTp,
+    poiType: result.poiType ?? void 0,
+    bosMssTag: result.bosMssTag ?? void 0,
+    leverage: live.leverage,
+    marginUsed
+  });
+  logger.info(
+    { accountId, symbol, direction: result.direction, lot, success: pipelineResult.success, slVerified: pipelineResult.slVerified, tpVerified: pipelineResult.tpVerified },
+    "Auto-execution pipeline completed"
+  );
+}
 async function runScheduledAnalysis() {
   if (running || !hasSupabaseConfig() || !process.env.METAAPI_TOKEN) return;
   running = true;
@@ -34550,6 +34991,9 @@ async function runScheduledAnalysis() {
                   updated_at: result.lastUpdated
                 }
               });
+              if (cycleStatus.state === "ACTIVE") {
+                await evaluateAndAutoExecuteTrade(profile.id, profile.metaapi_account_id, symbol);
+              }
             } catch (error) {
               logger.warn(
                 { accountId: profile.id, symbol, error },
@@ -34925,50 +35369,6 @@ function runBacktest(input) {
   };
 }
 
-// src/lib/market.ts
-var NEWS_SYMBOLS = {
-  XAUUSD: ["USD"],
-  NAS100: ["USD"],
-  US30: ["USD"],
-  EURUSD: ["EUR", "USD"],
-  GBPUSD: ["GBP", "USD"]
-};
-function currenciesForSymbol(symbol) {
-  return NEWS_SYMBOLS[symbol] ?? ["USD"];
-}
-async function hasHighImpactNewsWithin(symbol, minutes) {
-  const token = process.env.FINNHUB_API_KEY;
-  if (!token) {
-    logger.warn("FINNHUB_API_KEY missing; skipping news blackout filter");
-    return { blocked: false, event: null, warning: "Missing FINNHUB_API_KEY" };
-  }
-  const now = /* @__PURE__ */ new Date();
-  const end = new Date(now.getTime() + minutes * 6e4);
-  const from = now.toISOString().slice(0, 10);
-  const to = end.toISOString().slice(0, 10);
-  try {
-    const response = await fetch(
-      `https://finnhub.io/api/v1/calendar/economic?from=${from}&to=${to}&token=${encodeURIComponent(token)}`
-    );
-    if (!response.ok) {
-      logger.warn({ status: response.status }, "Finnhub calendar request failed");
-      return { blocked: false, event: null, warning: "News service unavailable" };
-    }
-    const payload = await response.json();
-    const currencies = currenciesForSymbol(symbol);
-    const nowMs = now.getTime();
-    const windowMs = minutes * 6e4;
-    const event = (payload.economicCalendar ?? []).find((candidate) => {
-      const timeMs = candidate.time ? new Date(candidate.time).getTime() : NaN;
-      return candidate.impact?.toLowerCase() === "high" && currencies.includes(candidate.country ?? "") && Number.isFinite(timeMs) && Math.abs(timeMs - nowMs) <= windowMs;
-    });
-    return event ? { blocked: true, event: event.event ?? "High impact event" } : { blocked: false, event: null };
-  } catch (error) {
-    logger.warn({ error }, "Error querying Finnhub economic calendar");
-    return { blocked: false, event: null, warning: "News service error" };
-  }
-}
-
 // src/routes/engine.ts
 var router4 = (0, import_express4.Router)();
 function errorMessage2(error) {
@@ -35125,49 +35525,6 @@ router4.post("/engine/backtest", async (req, res) => {
     res.status(message.startsWith("Add ") ? 400 : 502).json({ error: message });
   }
 });
-async function tradeGate(accountId, symbol, risk, positions) {
-  const diagnostics = [];
-  if (positions.some((position) => position.symbol === symbol)) {
-    diagnostics.push("Duplicate symbol blocked");
-  }
-  const groups = [
-    ["XAUUSD", "NAS100", "US30"],
-    ["EURUSD", "GBPUSD"]
-  ];
-  const group = groups.find((members) => members.includes(symbol));
-  if (group && positions.filter((position) => group.includes(position.symbol)).length >= 2) {
-    diagnostics.push("Correlated position limit reached");
-  }
-  const day = /* @__PURE__ */ new Date();
-  if (day.getUTCDay() === 5 && (day.getUTCHours() > 21 || day.getUTCHours() === 21 && day.getUTCMinutes() >= 45)) {
-    diagnostics.push("Friday 21:45 GMT close \u2014 no new trades");
-  }
-  const journalRows = await supabaseRequest("journal", {
-    query: {
-      select: "pnl,status,created_at",
-      account_id: `eq.${accountId}`,
-      status: "eq.CLOSED",
-      order: "created_at.desc",
-      limit: 500
-    }
-  });
-  const now = Date.now();
-  const dayPnl = journalRows.filter((row) => now - new Date(String(row.created_at ?? 0)).getTime() <= 864e5).reduce((sum, row) => sum + Number(row.pnl ?? 0), 0);
-  const weekPnl = journalRows.filter((row) => now - new Date(String(row.created_at ?? 0)).getTime() <= 7 * 864e5).reduce((sum, row) => sum + Number(row.pnl ?? 0), 0);
-  const equity = Number(risk.__equity ?? 0);
-  if (equity > 0 && dayPnl <= -(equity * Number(risk.daily_loss ?? 3)) / 100) {
-    diagnostics.push(`Daily loss limit reached (${risk.daily_loss ?? 3}%)`);
-  }
-  if (equity > 0 && weekPnl <= -(equity * Number(risk.weekly_loss ?? 6)) / 100) {
-    diagnostics.push(`Weekly loss limit reached (${risk.weekly_loss ?? 6}%)`);
-  }
-  const news = await hasHighImpactNewsWithin(
-    symbol,
-    Number(risk.news_minutes ?? 30)
-  );
-  if (news.blocked) diagnostics.push(`High-impact news blocked: ${news.event}`);
-  return diagnostics;
-}
 router4.post("/engine/execute", async (req, res) => {
   try {
     const input = ExecuteTradeBody.parse(req.body);
@@ -35175,34 +35532,24 @@ router4.post("/engine/execute", async (req, res) => {
     const riskRows = await supabaseRequest("risk_settings", {
       query: { select: "*", account_id: `eq.${input.accountId}`, limit: 1 }
     });
-    const risk = riskRows[0] ?? {
-      risk_per_trade: 1,
-      daily_loss: 3,
-      weekly_loss: 6,
-      news_minutes: 30
+    const riskRow = riskRows[0] ?? {};
+    const riskSettings = {
+      riskPerTrade: Number(riskRow.risk_per_trade ?? 1),
+      dailyLoss: Number(riskRow.daily_loss ?? 3),
+      weeklyLoss: Number(riskRow.weekly_loss ?? 6),
+      spreadMultiplier: Number(riskRow.spread_multiplier ?? 2.5),
+      newsMinutes: Number(riskRow.news_minutes ?? 30)
     };
-    const live = await getLiveAccountSnapshot(input.accountId, {
-      brokerName: typeof profile?.broker_name === "string" ? profile.broker_name : void 0,
-      server: typeof profile?.server === "string" ? profile.server : void 0
-    });
     if (isTradingHalted(input.accountId)) {
       res.status(409).json({ error: "Trading halted by emergency stop; reconnect and explicitly re-arm the account" });
       return;
     }
-    if (!live.connected || !live.leverage || !live.equity) {
-      res.status(409).json({ error: "Real broker leverage and equity are required before trading" });
-      return;
-    }
-    const diagnostics = await tradeGate(
-      input.accountId,
-      input.symbol,
-      { ...risk, __equity: live.equity },
-      live.positions.filter(
-        (position) => typeof position.symbol === "string"
-      )
-    );
-    if (diagnostics.length) {
-      res.status(409).json({ error: diagnostics.join("; ") });
+    const live = await getLiveAccountSnapshot(input.accountId, {
+      brokerName: typeof profile?.broker_name === "string" ? profile.broker_name : void 0,
+      server: typeof profile?.server === "string" ? profile.server : void 0
+    });
+    if (!live.connected || !live.leverage || !live.equity || !live.balance) {
+      res.status(409).json({ error: "Real broker connection, leverage, balance, and equity are required before trading" });
       return;
     }
     const realSymbol = await resolveMetaApiSymbol(
@@ -35228,6 +35575,32 @@ router4.post("/engine/execute", async (req, res) => {
       res.status(409).json({ error: `Broker market status blocks trading: ${specification.tradeMode}` });
       return;
     }
+    const averageAtr2 = candles.length > 15 ? candles.slice(-14).reduce((sum, candle) => sum + candle.high - candle.low, 0) / 14 : 0;
+    const spread = price.ask - price.bid;
+    const maxSpread = Math.max(specification.tickSize, averageAtr2 * 0.1) * riskSettings.spreadMultiplier;
+    const riskCheck = await evaluateTradeRisk({
+      accountId: input.accountId,
+      symbol: input.symbol,
+      direction: input.direction,
+      equity: live.equity,
+      balance: live.balance,
+      freeMargin: live.freeMargin,
+      openPositions: live.positions.map((p) => ({
+        id: p.id ?? void 0,
+        symbol: p.symbol ?? input.symbol,
+        volume: p.volume,
+        openPrice: p.openPrice
+      })),
+      spreadInfo: {
+        currentSpread: spread,
+        maxAllowedSpread: maxSpread
+      },
+      riskSettings
+    });
+    if (!riskCheck.passed) {
+      res.status(409).json({ error: riskCheck.violations.join("; ") });
+      return;
+    }
     const entryPrice = input.direction === "BUY" ? price.ask : price.bid;
     if (input.direction === "BUY" && (input.sl >= entryPrice || input.tp <= entryPrice)) {
       res.status(409).json({ error: "BUY orders require SL below and TP above the live ask" });
@@ -35235,12 +35608,6 @@ router4.post("/engine/execute", async (req, res) => {
     }
     if (input.direction === "SELL" && (input.sl <= entryPrice || input.tp >= entryPrice)) {
       res.status(409).json({ error: "SELL orders require SL above and TP below the live bid" });
-      return;
-    }
-    const last = candles.slice(0, -1).at(-1);
-    const averageAtr2 = candles.length > 15 ? candles.slice(-14).reduce((sum, candle) => sum + candle.high - candle.low, 0) / 14 : 0;
-    if (!last || averageAtr2 <= 0) {
-      res.status(409).json({ error: "Live candle data unavailable; order blocked" });
       return;
     }
     const slDistance = Math.abs(entryPrice - input.sl);
@@ -35254,15 +35621,9 @@ router4.post("/engine/execute", async (req, res) => {
       res.status(409).json({ error: "TP must target a 1:2 to 1:3 risk-to-reward ratio" });
       return;
     }
-    const spread = price.ask - price.bid;
-    const maxSpread = Math.max(specification.tickSize, averageAtr2 * 0.1) * Number(risk.spread_multiplier ?? 2.5);
-    if (spread > maxSpread) {
-      res.status(409).json({ error: "Current broker spread exceeds the configured protection threshold" });
-      return;
-    }
-    const riskPercent = Number(risk.risk_per_trade ?? 1) / 100;
+    const effectiveRiskPercent = riskSettings.riskPerTrade / 100 * riskCheck.riskMultiplier;
     const lossPerLot = slDistance / specification.tickSize * specification.tickValue;
-    const requestedLot = live.equity * riskPercent / lossPerLot;
+    const requestedLot = live.equity * effectiveRiskPercent / lossPerLot;
     const volumeStep = specification.volumeStep;
     const floorLot = (value) => Math.floor(value / volumeStep) * volumeStep;
     const lot = floorLot(Math.min(input.lot, requestedLot, specification.volumeMax));
@@ -35275,45 +35636,26 @@ router4.post("/engine/execute", async (req, res) => {
       res.status(409).json({ error: "Broker free-margin protection blocked this order" });
       return;
     }
-    const result = await executeMetaApiTrade({
+    const pipelineResult = await runPostExecutionPipeline({
       accountId: input.accountId,
-      actionType: input.direction === "BUY" ? "ORDER_TYPE_BUY" : "ORDER_TYPE_SELL",
-      symbol: realSymbol,
-      volume: lot,
-      stopLoss: input.sl,
-      takeProfit: input.tp
+      symbol: input.symbol,
+      realSymbol,
+      direction: input.direction,
+      lot,
+      sl: input.sl,
+      tp: input.tp,
+      poiType: input.poiType ?? void 0,
+      bosMssTag: input.bosMssTag ?? void 0,
+      leverage: live.leverage,
+      marginUsed
     });
-    const orderId = typeof result.orderId === "string" ? result.orderId : typeof result.positionId === "string" ? result.positionId : null;
-    const brokerPositionId = typeof result.positionId === "string" ? result.positionId : null;
-    await supabaseRequest("journal", {
-      method: "POST",
-      prefer: "return=representation",
-      body: {
-        account_id: input.accountId,
-        symbol: input.symbol,
-        real_symbol: realSymbol,
-        direction: input.direction,
-        entry: entryPrice,
-        sl: input.sl,
-        initial_sl: input.sl,
-        tp: input.tp,
-        lot,
-        pnl: 0,
-        r_multiple: 0,
-        status: "OPEN",
-        broker_position_id: brokerPositionId,
-        broker_order_id: typeof result.orderId === "string" ? result.orderId : null,
-        broker_status: "OPEN",
-        poi_type: input.poiType ?? null,
-        bos_mss_tag: input.bosMssTag ?? null,
-        htf_bias: null,
-        leverage: live.leverage,
-        margin_used: marginUsed
-      }
-    });
+    if (!pipelineResult.success) {
+      res.status(502).json({ error: pipelineResult.error ?? "Order execution pipeline failed" });
+      return;
+    }
     res.json({
-      orderId,
-      positionId: brokerPositionId,
+      orderId: pipelineResult.orderId,
+      positionId: pipelineResult.positionId,
       accountId: input.accountId,
       symbol: input.symbol,
       direction: input.direction,
@@ -35323,7 +35665,10 @@ router4.post("/engine/execute", async (req, res) => {
       tp: input.tp,
       leverage: live.leverage,
       marginUsed,
-      status: "OPEN"
+      slVerified: pipelineResult.slVerified,
+      tpVerified: pipelineResult.tpVerified,
+      status: "OPEN",
+      logs: pipelineResult.logs
     });
   } catch (error) {
     const message = errorMessage2(error);

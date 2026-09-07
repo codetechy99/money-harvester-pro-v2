@@ -1,6 +1,12 @@
 import { logger } from "./logger";
 import { hasHighImpactNewsWithin } from "./market";
-import { supabaseRequest } from "./supabase";
+import { supabaseRequest, findProfile } from "./supabase";
+import {
+  evaluatePropSafety,
+  getDefaultPropRules,
+  type AccountProfile,
+  type AccountProfileMode,
+} from "./account-profile";
 
 export type RiskCheckInput = {
   accountId: string;
@@ -15,6 +21,10 @@ export type RiskCheckInput = {
     volume?: number | null;
     openPrice?: number | null;
   }>;
+  spreadInfo?: {
+    currentSpread: number;
+    maxAllowedSpread: number;
+  };
   riskSettings?: {
     riskPerTrade?: number; // e.g. 1 (%)
     dailyLoss?: number; // e.g. 3 (%)
@@ -48,8 +58,19 @@ export async function evaluateTradeRisk(input: RiskCheckInput): Promise<RiskChec
     equity,
     balance,
     openPositions,
+    spreadInfo,
     riskSettings = {},
   } = input;
+
+  // Fail closed if required critical numbers are missing or invalid
+  if (!Number.isFinite(equity) || equity <= 0 || !Number.isFinite(balance) || balance <= 0) {
+    return {
+      passed: false,
+      violations: ["Fail-Closed: Live broker equity and balance must be valid positive numbers"],
+      warnings: [],
+      riskMultiplier: 0.0,
+    };
+  }
 
   const dailyLossLimitPct = riskSettings.dailyLoss ?? 3;
   const weeklyLossLimitPct = riskSettings.weeklyLoss ?? 6;
@@ -88,13 +109,50 @@ export async function evaluateTradeRisk(input: RiskCheckInput): Promise<RiskChec
     violations.push(`Maximum symbol exposure lot limit (${maxSymbolExposure} lots) reached on ${symbol}`);
   }
 
-  // 5. Friday Market Close Session Filter
+  // 5. Spread Check
+  if (spreadInfo) {
+    if (spreadInfo.currentSpread > spreadInfo.maxAllowedSpread) {
+      violations.push(`Current broker spread (${spreadInfo.currentSpread.toFixed(5)}) exceeds maximum allowed spread threshold (${spreadInfo.maxAllowedSpread.toFixed(5)})`);
+    }
+  }
+
+  // 6. Friday Market Close Session Filter
   const day = new Date();
   if (day.getUTCDay() === 5 && (day.getUTCHours() > 21 || (day.getUTCHours() === 21 && day.getUTCMinutes() >= 45))) {
     violations.push("Friday 21:45 GMT session cutoff — no new positions allowed before weekend");
   }
 
-  // 6. Journal History Checks (Daily/Weekly Loss, Consecutive Losses, Symbol Cooldown)
+  // 7. Wire Prop Account Protection Gate
+  try {
+    const profile = await findProfile(accountId);
+    if (profile) {
+      const mode: AccountProfileMode = (typeof profile.mode === "string" ? profile.mode : "DEMO") as AccountProfileMode;
+      if (mode === "PROP") {
+        const accountProfile: AccountProfile = {
+          id: accountId,
+          mode: "PROP",
+          startingBalance: typeof profile.starting_balance === "number" ? profile.starting_balance : 100000,
+          currentBalance: balance,
+          currentEquity: equity,
+          highestEquity: typeof profile.highest_equity === "number" ? profile.highest_equity : Math.max(equity, profile.starting_balance as number ?? 100000),
+          dailyStartingEquity: typeof profile.daily_starting_equity === "number" ? profile.daily_starting_equity : balance,
+          propRules: getDefaultPropRules(typeof profile.starting_balance === "number" ? profile.starting_balance : 100000),
+        };
+
+        const propSafety = evaluatePropSafety(accountProfile, totalOpenLot);
+        if (propSafety.isViolated) {
+          violations.push(propSafety.violationReason ?? "Prop account rule violated");
+        } else if (propSafety.isDefensive) {
+          warnings.push("PROP Account approaching risk limit (defensive posture active); trade risk reduced by 50%");
+          riskMultiplier *= 0.5;
+        }
+      }
+    }
+  } catch (error) {
+    logger.warn({ accountId, error }, "Prop safety check warning in risk engine");
+  }
+
+  // 8. Journal History Checks (Daily/Weekly Loss, Consecutive Losses, Symbol Cooldown)
   try {
     const journalRows = await supabaseRequest<Record<string, unknown>[]>("journal", {
       query: {
@@ -156,7 +214,7 @@ export async function evaluateTradeRisk(input: RiskCheckInput): Promise<RiskChec
     logger.warn({ accountId, error }, "Risk engine journal history check skipped due to query error");
   }
 
-  // 7. High-Impact News Filter
+  // 9. High-Impact News Filter
   try {
     const news = await hasHighImpactNewsWithin(symbol, newsMinutes);
     if (news.blocked) {

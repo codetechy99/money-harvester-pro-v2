@@ -359,15 +359,17 @@ export function calculateSetupScore(input: {
     ? 0
     : input.htfBias
       ? 25
-      : 10;
+      : 0;
 
-  const sweepDone = input.liquiditySwept ?? Boolean(input.sweep);
+  const sweepDone = Boolean(input.liquiditySwept ?? input.sweep);
   const liquiditySweep = sweepDone ? 25 : 0;
 
-  const poiPresent = input.poiPresent ?? Boolean(input.displacement?.poi);
+  const poiPresent = Boolean(input.poiPresent ?? input.displacement?.poi);
   const poiQuality = poiPresent ? 20 : 0;
 
-  const bosMss = input.bosMssPresent ? 15 : 10;
+  const bosMssPresent = Boolean(input.bosMssPresent);
+  const bosMss = bosMssPresent ? 15 : 0;
+
   const m5Confirmation = input.m5Confirmed ? 15 : 0;
 
   const score = htfAlignment + liquiditySweep + poiQuality + bosMss + m5Confirmation;
@@ -378,15 +380,26 @@ export function calculateSetupScore(input: {
     isBullish = false;
   }
 
+  // Mandatory core conditions: ALL must be met to trigger execution action
+  const hasMandatoryConditions =
+    !input.htfConflict &&
+    Boolean(input.htfBias) &&
+    sweepDone &&
+    bosMssPresent &&
+    poiPresent &&
+    input.m5Confirmed;
+
   let action: SetupScoreResult["action"] = "REJECT";
   let direction: "BUY" | "SELL" | null = null;
 
-  if (score >= 80) {
-    action = isBullish ? "STRONG_BUY" : "STRONG_SELL";
-    direction = isBullish ? "BUY" : "SELL";
-  } else if (score >= 60) {
-    action = isBullish ? "BUY" : "SELL";
-    direction = isBullish ? "BUY" : "SELL";
+  if (hasMandatoryConditions) {
+    if (score >= 80) {
+      action = isBullish ? "STRONG_BUY" : "STRONG_SELL";
+      direction = isBullish ? "BUY" : "SELL";
+    } else if (score >= 60) {
+      action = isBullish ? "BUY" : "SELL";
+      direction = isBullish ? "BUY" : "SELL";
+    }
   }
 
   return {

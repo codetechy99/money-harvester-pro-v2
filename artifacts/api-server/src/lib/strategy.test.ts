@@ -80,6 +80,19 @@ test("calculateSetupScore calculates correct breakdown and actions", () => {
     m5Confirmation: 15,
   });
 
+  const missingSweep = calculateSetupScore({
+    htfBias: "BULLISH_DISCOUNT",
+    htfConflict: false,
+    liquiditySwept: false,
+    poiPresent: true,
+    bosMssPresent: true,
+    m5Confirmed: true,
+  });
+
+  assert.equal(missingSweep.score, 75);
+  assert.equal(missingSweep.action, "REJECT"); // Mandatory condition missing
+  assert.equal(missingSweep.direction, null);
+
   const lowScore = calculateSetupScore({
     htfBias: null,
     htfConflict: true,
@@ -89,7 +102,7 @@ test("calculateSetupScore calculates correct breakdown and actions", () => {
     m5Confirmed: false,
   });
 
-  assert.equal(lowScore.score, 10);
+  assert.equal(lowScore.score, 0);
   assert.equal(lowScore.action, "REJECT");
   assert.equal(lowScore.direction, null);
 });
