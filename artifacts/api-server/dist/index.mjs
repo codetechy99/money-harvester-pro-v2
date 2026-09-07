@@ -22201,7 +22201,7 @@ var require_request = __commonJS({
     defineGetter(req, "path", function path() {
       return parse(this).pathname;
     });
-    defineGetter(req, "host", function host() {
+    defineGetter(req, "host", function host2() {
       var trust = this.app.get("trust proxy fn");
       var val = this.get("X-Forwarded-Host");
       if (!val || !trust(this.socket.remoteAddress, 0)) {
@@ -22212,11 +22212,11 @@ var require_request = __commonJS({
       return val || void 0;
     });
     defineGetter(req, "hostname", function hostname() {
-      var host = this.host;
-      if (!host) return;
-      var offset = host[0] === "[" ? host.indexOf("]") + 1 : 0;
-      var index = host.indexOf(":", offset);
-      return index !== -1 ? host.substring(0, index) : host;
+      var host2 = this.host;
+      if (!host2) return;
+      var offset = host2[0] === "[" ? host2.indexOf("]") + 1 : 0;
+      var index = host2.indexOf(":", offset);
+      return index !== -1 ? host2.substring(0, index) : host2;
     });
     defineGetter(req, "fresh", function() {
       var method = this.method;
@@ -28198,7 +28198,7 @@ var require_pino = __commonJS({
     function pinoBundlerAbsolutePath(p) {
       try {
         const path = __require("path");
-        const outputDir = "/home/runner/workspace/artifacts/api-server/dist";
+        const outputDir = "/app/artifacts/api-server/dist";
         return path.resolve(outputDir, p.replace(/^\.\//, ""));
       } catch (e) {
         const f = new Function("p", "return new URL(p, import.meta.url).pathname");
@@ -33292,7 +33292,7 @@ async function moveMetaApiPositionStopToBreakEven(input) {
 }
 async function closeAllMetaApiPositions(accountId, positions) {
   haltTrading(accountId);
-  const closable = positions.filter((position) => Boolean(position.id));
+  const closable = positions.filter((position) => typeof position.id === "string" && Boolean(position.id));
   const outcomes = await Promise.all(
     closable.map(async (position) => {
       try {
@@ -33321,7 +33321,7 @@ async function closeAllMetaApiPositions(accountId, positions) {
   let remaining = [];
   try {
     const verified = await getLiveAccountSnapshot(accountId);
-    remaining = verified.positions.map((position) => position.id).filter((id) => Boolean(id));
+    remaining = verified.positions.map((position) => position.id).filter((id) => typeof id === "string" && Boolean(id));
     if (!remaining.length) clearTradingHalt(accountId);
   } catch {
   }
@@ -33703,6 +33703,45 @@ function findPools(candles, swings, averageAtr2) {
   }
   return pools;
 }
+function evaluateLiquiditySweeps(candles, pools) {
+  if (!candles.length) return { pools, activeSweep: null };
+  const closedCandles = candles.slice(0, -1);
+  const averageAtr2 = atr(closedCandles.length ? closedCandles : candles);
+  let activeSweep = null;
+  const updatedPools = pools.map((pool) => {
+    let isSwept = pool.swept;
+    for (const candle of closedCandles) {
+      const sweptThisCandle = pool.type === "BSL" ? candle.high >= pool.avgPrice + averageAtr2 * 0.15 && candle.close < pool.avgPrice : candle.low <= pool.avgPrice - averageAtr2 * 0.15 && candle.close > pool.avgPrice;
+      if (sweptThisCandle) {
+        isSwept = true;
+        if (candle === closedCandles[closedCandles.length - 1]) {
+          activeSweep = { ...pool, swept: true };
+        }
+      }
+    }
+    return { ...pool, swept: isSwept };
+  });
+  return { pools: updatedPools, activeSweep };
+}
+function detectBosMss(candles, internalSwings) {
+  const closed = candles.slice(0, -1);
+  if (closed.length < 2) {
+    return { detected: false, type: null, tag: null };
+  }
+  const lastClosed = closed[closed.length - 1];
+  const prevClosed = closed[closed.length - 2];
+  const recentHighSwings = internalSwings.filter((s) => s.type === "HIGH" && s.index < closed.length - 1);
+  const recentLowSwings = internalSwings.filter((s) => s.type === "LOW" && s.index < closed.length - 1);
+  const lastHigh = recentHighSwings.at(-1);
+  const lastLow = recentLowSwings.at(-1);
+  if (lastHigh && lastClosed.close > lastHigh.price && prevClosed.close <= lastHigh.price) {
+    return { detected: true, type: "BULLISH_BOS", tag: "BOS_BULL" };
+  }
+  if (lastLow && lastClosed.close < lastLow.price && prevClosed.close >= lastLow.price) {
+    return { detected: true, type: "BEARISH_BOS", tag: "BOS_BEAR" };
+  }
+  return { detected: false, type: null, tag: null };
+}
 function calculateTrend(swings) {
   const highs = swings.filter((swing) => swing.type === "HIGH").slice(-2);
   const lows = swings.filter((swing) => swing.type === "LOW").slice(-2);
@@ -33715,39 +33754,172 @@ function calculateTrend(swings) {
   }
   return "RANGING";
 }
-function inferPoi(candles, internalSwings, pools, averageAtr2) {
-  const recent = candles.slice(-3);
+function detectPoi(candles, internalSwings, averageAtr2) {
+  const closed = candles.slice(0, -1);
+  const recent = closed.slice(-5);
   for (let offset = recent.length - 1; offset >= 0; offset -= 1) {
-    const candleIndex = candles.length - recent.length + offset;
+    const candleIndex = closed.length - recent.length + offset;
     const candle = recent[offset];
     const body = Math.abs(candle.close - candle.open);
-    const sameColorBefore = candles.slice(Math.max(0, candleIndex - 2), candleIndex).filter((item) => Math.sign(item.close - item.open) === Math.sign(candle.close - candle.open)).length;
     const breaksOpposite = internalSwings.some(
       (swing) => swing.index < candleIndex && (candle.close > swing.price && swing.type === "HIGH" || candle.close < swing.price && swing.type === "LOW")
     );
-    const activeSweep = pools.find((pool) => {
-      const wick = pool.type === "BSL" ? candle.high >= pool.avgPrice + averageAtr2 * 0.2 : candle.low <= pool.avgPrice - averageAtr2 * 0.2;
-      const closeBack = pool.type === "BSL" ? candle.close < pool.avgPrice : candle.close > pool.avgPrice;
-      const candleBody = Math.abs(candle.close - candle.open);
-      const wickLength = pool.type === "BSL" ? candle.high - Math.max(candle.open, candle.close) : Math.min(candle.open, candle.close) - candle.low;
-      return wick && closeBack && wickLength > candleBody;
-    });
-    if (body > averageAtr2 * 1.5 && sameColorBefore >= 2 && breaksOpposite) {
-      const bullish = candle.close > candle.open;
+    if (body > averageAtr2 * 1.2 && breaksOpposite) {
+      const isBull = candle.close > candle.open;
+      if (candleIndex >= 2 && candleIndex < closed.length) {
+        const prevCandle = closed[candleIndex - 1];
+        const nextCandle = closed[candleIndex + 1];
+        if (nextCandle) {
+          if (isBull && nextCandle.low > prevCandle.high) {
+            return {
+              high: nextCandle.low,
+              low: prevCandle.high,
+              creationIndex: candleIndex,
+              expiryIndex: candleIndex + 50,
+              touched: false,
+              type: "FVG_BULL",
+              creationTime: candle.time
+            };
+          }
+          if (!isBull && nextCandle.high < prevCandle.low) {
+            return {
+              high: prevCandle.low,
+              low: nextCandle.high,
+              creationIndex: candleIndex,
+              expiryIndex: candleIndex + 50,
+              touched: false,
+              type: "FVG_BEAR",
+              creationTime: candle.time
+            };
+          }
+        }
+      }
       return {
-        poi: {
-          high: candle.high,
-          low: candle.low,
-          creationIndex: candleIndex,
-          expiryIndex: candleIndex + 50,
-          touched: false,
-          type: bullish ? "OB_BULL" : "OB_BEAR"
-        },
-        swept: Boolean(activeSweep)
+        high: candle.high,
+        low: candle.low,
+        creationIndex: candleIndex,
+        expiryIndex: candleIndex + 50,
+        touched: false,
+        type: isBull ? "OB_BULL" : "OB_BEAR",
+        creationTime: candle.time
       };
     }
   }
-  return { poi: null, swept: false };
+  return null;
+}
+function evaluateM5Confirmation(m5Candles, m15LastTime, poi) {
+  if (!m5Candles.length) {
+    return {
+      evaluated: false,
+      m5Confirmed: false,
+      poiTouched: false,
+      reason: "No M5 candles returned by MetaApi",
+      diagnostics: "M5 confirmation skipped: missing M5 data"
+    };
+  }
+  const closedM5 = m5Candles.slice(0, -1);
+  if (!closedM5.length) {
+    return {
+      evaluated: false,
+      m5Confirmed: false,
+      poiTouched: false,
+      reason: "Insufficient closed M5 candles",
+      diagnostics: "M5 confirmation skipped: waiting for closed M5 candle"
+    };
+  }
+  if (!poi) {
+    return {
+      evaluated: true,
+      m5Confirmed: false,
+      poiTouched: false,
+      reason: "No active POI detected",
+      diagnostics: "M5 confirmation evaluated: no POI present"
+    };
+  }
+  const poiTouched = closedM5.some((candle) => {
+    const afterPoiTime = poi.creationTime ? candle.time >= poi.creationTime : candle.time >= m15LastTime;
+    return afterPoiTime && candle.high >= poi.low && candle.low <= poi.high;
+  });
+  if (!poiTouched) {
+    return {
+      evaluated: true,
+      m5Confirmed: false,
+      poiTouched: false,
+      reason: "M15 POI not touched on M5",
+      diagnostics: `M5 confirmation evaluated: POI [${poi.type} ${poi.low}-${poi.high}] untouched`
+    };
+  }
+  const isBullPoi = poi.type === "OB_BULL" || poi.type === "FVG_BULL";
+  const m5Swings = detectSwings(closedM5, 3);
+  const lastM5Swings = m5Swings.slice(-2);
+  let microConfirmed = false;
+  if (lastM5Swings.length >= 2) {
+    if (isBullPoi) {
+      const highSwings = lastM5Swings.filter((s) => s.type === "HIGH");
+      if (highSwings.length >= 2 && highSwings[1].price > highSwings[0].price) {
+        microConfirmed = true;
+      }
+    } else {
+      const lowSwings = lastM5Swings.filter((s) => s.type === "LOW");
+      if (lowSwings.length >= 2 && lowSwings[1].price < lowSwings[0].price) {
+        microConfirmed = true;
+      }
+    }
+  }
+  if (!microConfirmed && closedM5.length >= 2) {
+    const recentM5 = closedM5.slice(-3);
+    const avgM5Atr = atr(closedM5, 10);
+    const microDisplacement = recentM5.some((c) => {
+      const body = Math.abs(c.close - c.open);
+      return isBullPoi ? c.close > c.open && body > avgM5Atr * 1.1 : c.close < c.open && body > avgM5Atr * 1.1;
+    });
+    if (microDisplacement) {
+      microConfirmed = true;
+    }
+  }
+  return {
+    evaluated: true,
+    m5Confirmed: microConfirmed,
+    poiTouched: true,
+    reason: microConfirmed ? "M5 micro-structure displacement confirmed" : "M5 POI touched, waiting micro confirmation",
+    diagnostics: microConfirmed ? "M5 confirmation evaluated: micro MSS/displacement confirmed" : "M5 confirmation evaluated: POI touched, awaiting micro displacement"
+  };
+}
+function calculateSetupScore(input) {
+  const htfAlignment = input.htfConflict ? 0 : input.htfBias ? 25 : 10;
+  const sweepDone = input.liquiditySwept ?? Boolean(input.sweep);
+  const liquiditySweep = sweepDone ? 25 : 0;
+  const poiPresent = input.poiPresent ?? Boolean(input.displacement?.poi);
+  const poiQuality = poiPresent ? 20 : 0;
+  const bosMss = input.bosMssPresent ? 15 : 10;
+  const m5Confirmation = input.m5Confirmed ? 15 : 0;
+  const score = htfAlignment + liquiditySweep + poiQuality + bosMss + m5Confirmation;
+  const poiType = input.displacement?.poi?.type;
+  let isBullish = poiType === "OB_BULL" || poiType === "FVG_BULL" || input.htfBias?.includes("BULLISH") || input.trend === "BULLISH";
+  if (poiType === "OB_BEAR" || poiType === "FVG_BEAR" || input.htfBias?.includes("BEARISH") || input.trend === "BEARISH") {
+    isBullish = false;
+  }
+  let action = "REJECT";
+  let direction = null;
+  if (score >= 80) {
+    action = isBullish ? "STRONG_BUY" : "STRONG_SELL";
+    direction = isBullish ? "BUY" : "SELL";
+  } else if (score >= 60) {
+    action = isBullish ? "BUY" : "SELL";
+    direction = isBullish ? "BUY" : "SELL";
+  }
+  return {
+    score,
+    breakdown: {
+      htfAlignment,
+      liquiditySweep,
+      poiQuality,
+      bosMss,
+      m5Confirmation
+    },
+    action,
+    direction
+  };
 }
 async function analyzeSymbol(accountId, baseSymbol) {
   const candidates = [
@@ -33786,42 +33958,95 @@ async function analyzeSymbol(accountId, baseSymbol) {
       poiType: null,
       poiHigh: null,
       poiLow: null,
+      setupScore: 0,
+      scoreAction: "REJECT",
+      direction: null,
+      suggestedEntry: null,
+      suggestedSl: null,
+      suggestedTp: null,
+      candleTimestamp: (/* @__PURE__ */ new Date()).toISOString(),
       diagnostics: ["SCANNING \u2014 not enough live M15 candles returned by MetaApi"],
       lastUpdated: (/* @__PURE__ */ new Date()).toISOString(),
       liquidityPool: [],
-      poi: null
+      poi: null,
+      bosMssTag: null
     };
   }
-  const averageAtr2 = atr(m15);
-  const externalSwings = detectSwings(m15, 10);
-  const internalSwings = detectSwings(m15, 5);
+  const closedM15 = m15.slice(0, -1);
+  const formingCandle = m15[m15.length - 1];
+  const averageAtr2 = atr(closedM15);
+  const externalSwings = detectSwings(closedM15, 10);
+  const internalSwings = detectSwings(closedM15, 5);
   const trend = calculateTrend(externalSwings);
-  const pools = findPools(m15, externalSwings, averageAtr2);
-  const sweep = pools.find((pool) => {
-    const candle = m15[m15.length - 1];
-    return pool.type === "BSL" ? candle.high >= pool.avgPrice + averageAtr2 * 0.2 && candle.close < pool.avgPrice : candle.low <= pool.avgPrice - averageAtr2 * 0.2 && candle.close > pool.avgPrice;
-  });
-  const displacement = inferPoi(m15, internalSwings, pools, averageAtr2);
+  const rawPools = findPools(closedM15, externalSwings, averageAtr2);
+  const { pools, activeSweep } = evaluateLiquiditySweeps(closedM15, rawPools);
+  const bosMssResult = detectBosMss(closedM15, internalSwings);
+  const poi = detectPoi(closedM15, internalSwings, averageAtr2);
   const dailyTrend = calculateTrend(detectSwings(daily, 3));
   const h4Trend = calculateTrend(detectSwings(h4, 5));
-  const current = m15[m15.length - 1];
+  const currentClose = formingCandle.close;
   const dailyHigh = Math.max(...daily.slice(-50).map((candle) => candle.high));
   const dailyLow = Math.min(...daily.slice(-50).map((candle) => candle.low));
   const equilibrium = (dailyHigh + dailyLow) / 2;
-  const htfBias = dailyTrend === "BULLISH" && current.close <= equilibrium ? "BULLISH_DISCOUNT" : dailyTrend === "BEARISH" && current.close >= equilibrium ? "BEARISH_PREMIUM" : dailyTrend ?? null;
+  const htfBias = dailyTrend === "BULLISH" && currentClose <= equilibrium ? "BULLISH_DISCOUNT" : dailyTrend === "BEARISH" && currentClose >= equilibrium ? "BEARISH_PREMIUM" : dailyTrend ?? null;
   const htfConflict = dailyTrend === "BULLISH" && h4Trend === "BEARISH" || dailyTrend === "BEARISH" && h4Trend === "BULLISH";
-  const poi = displacement.poi;
-  const poiTouched = poi && m5.some(
-    (candle) => candle.time > m15[m15.length - 1].time && candle.high >= poi.low && candle.low <= poi.high
-  );
-  const state = poi ? poiTouched ? "LTF_CONFIRM_M5" : displacement.swept ? "DISPLACEMENT_CONFIRMED" : "WAITING_POI_TOUCH" : sweep ? "SWEPT" : pools.length ? "LIQUIDITY_FOUND" : "SCANNING";
+  const lastM15Time = closedM15[closedM15.length - 1].time;
+  const m5Eval = evaluateM5Confirmation(m5, lastM15Time, poi);
+  if (poi) {
+    poi.touched = m5Eval.poiTouched;
+  }
+  const isLiquiditySwept = pools.some((p) => p.swept);
+  const setupScoreObj = calculateSetupScore({
+    htfBias,
+    htfConflict,
+    liquiditySwept: isLiquiditySwept,
+    poiPresent: Boolean(poi),
+    bosMssPresent: bosMssResult.detected,
+    m5Confirmed: m5Eval.m5Confirmed,
+    displacement: poi ? { poi, swept: isLiquiditySwept } : void 0,
+    trend
+  });
+  let state = "SCANNING";
+  if (poi) {
+    if (m5Eval.m5Confirmed) {
+      state = "LTF_CONFIRM_M5";
+    } else if (m5Eval.poiTouched) {
+      state = "WAITING_POI_TOUCH";
+    } else {
+      state = "DISPLACEMENT_CONFIRMED";
+    }
+  } else if (activeSweep) {
+    state = "SWEPT";
+  } else if (pools.length) {
+    state = "LIQUIDITY_FOUND";
+  }
+  let direction = setupScoreObj.direction;
+  let suggestedEntry = null;
+  let suggestedSl = null;
+  let suggestedTp = null;
+  if (poi && direction) {
+    const isBull = direction === "BUY";
+    suggestedEntry = currentClose;
+    if (isBull) {
+      suggestedSl = poi.low - averageAtr2 * 0.2;
+      const slDistance = Math.abs(suggestedEntry - suggestedSl);
+      suggestedTp = suggestedEntry + slDistance * 2.5;
+    } else {
+      suggestedSl = poi.high + averageAtr2 * 0.2;
+      const slDistance = Math.abs(suggestedEntry - suggestedSl);
+      suggestedTp = suggestedEntry - slDistance * 2.5;
+    }
+  }
+  const activeSweepPool = activeSweep;
   const diagnostics = [
     `M15 trend ${trend ?? "UNKNOWN"}; daily ${dailyTrend ?? "UNKNOWN"}; H4 ${h4Trend ?? "UNKNOWN"}`,
-    pools.length ? `${pools.length} liquidity pool${pools.length === 1 ? "" : "s"} detected` : "No equal-high/equal-low pool within 0.15 ATR14",
-    sweep ? `${sweep.type} sweep detected in latest M15 candle` : "Waiting for a valid liquidity sweep",
-    poi ? `${poi.type} created at M15 index ${poi.creationIndex}; expires after 50 bars` : "Waiting for displacement body > 1.5 ATR and internal break",
+    pools.length ? `${pools.length} liquidity pool${pools.length === 1 ? "" : "s"} detected (${pools.filter((p) => p.swept).length} swept)` : "No equal-high/equal-low pool within threshold",
+    activeSweepPool ? `${activeSweepPool.type} sweep confirmed on closed candle` : isLiquiditySwept ? "Historical liquidity sweep present on active pool" : "Waiting for a valid liquidity sweep",
+    bosMssResult.detected ? `Structure break detected: ${bosMssResult.type}` : "No structural break (BOS/MSS) confirmed on closed candle",
+    poi ? `${poi.type} created at M15 index ${poi.creationIndex}` : "Waiting for displacement body > 1.2 ATR and internal break",
     htfConflict ? "HTF conflict \u2014 risk must be reduced to 50%" : htfBias ? `HTF location ${htfBias}` : "HTF premium/discount not aligned",
-    state === "LTF_CONFIRM_M5" ? "M15 POI touched; waiting for M5 micro MSS confirmation" : "No executable confirmation yet"
+    m5Eval.diagnostics,
+    `Setup Score: ${setupScoreObj.score}/100 (${setupScoreObj.action})`
   ];
   return {
     realSymbol,
@@ -33832,16 +34057,258 @@ async function analyzeSymbol(accountId, baseSymbol) {
     poiType: poi?.type ?? null,
     poiHigh: poi?.high ?? null,
     poiLow: poi?.low ?? null,
+    setupScore: setupScoreObj.score,
+    scoreAction: setupScoreObj.action,
+    direction,
+    suggestedEntry,
+    suggestedSl,
+    suggestedTp,
+    candleTimestamp: formingCandle.time,
     diagnostics,
     lastUpdated: (/* @__PURE__ */ new Date()).toISOString(),
     liquidityPool: pools,
-    poi
+    poi,
+    bosMssTag: bosMssResult.tag
+  };
+}
+
+// src/lib/account-profile.ts
+function getDefaultPropRules(startingBalance = 1e5) {
+  return {
+    startingBalance,
+    profitTargetPercent: 10,
+    maxDailyLossPercent: 5,
+    maxOverallDrawdownPercent: 10,
+    trailingDrawdown: false,
+    maxPositions: 5,
+    maxTotalExposureLot: 5,
+    maxSymbolExposureLot: 2,
+    minTradingDays: 5,
+    maxLotSize: 2,
+    allowedSymbols: ["EURUSD", "GBPUSD", "XAUUSD", "NAS100", "US30"],
+    newsRestrictions: true,
+    weekendRestrictions: true
+  };
+}
+function getDefaultContestRules() {
+  return {
+    objective: "ROI",
+    targetProfit: 2e3,
+    targetLots: 50,
+    minWinRatePercent: 55,
+    maxDrawdownPercent: 15
+  };
+}
+function evaluatePropSafety(profile, openPositionsLot = 0) {
+  const rules = { ...getDefaultPropRules(profile.startingBalance), ...profile.propRules };
+  const starting = rules.startingBalance > 0 ? rules.startingBalance : profile.startingBalance || 1e5;
+  const equity = profile.currentEquity;
+  const dailyStart = profile.dailyStartingEquity > 0 ? profile.dailyStartingEquity : starting;
+  const highestEq = Math.max(profile.highestEquity, equity, starting);
+  const maxDailyLossAmount = dailyStart * (rules.maxDailyLossPercent / 100);
+  const currentDailyLoss = Math.max(0, dailyStart - equity);
+  const remainingDailyLossBuffer = Math.max(0, maxDailyLossAmount - currentDailyLoss);
+  const remainingDailyLossPercent = remainingDailyLossBuffer / dailyStart * 100;
+  const baseForOverall = rules.trailingDrawdown ? highestEq : starting;
+  const maxOverallDrawdownAmount = baseForOverall * (rules.maxOverallDrawdownPercent / 100);
+  const currentOverallDrawdown = Math.max(0, baseForOverall - equity);
+  const remainingOverallDrawdownBuffer = Math.max(0, maxOverallDrawdownAmount - currentOverallDrawdown);
+  const remainingOverallDrawdownPercent = remainingOverallDrawdownBuffer / baseForOverall * 100;
+  const targetEquity = starting * (1 + rules.profitTargetPercent / 100);
+  const distanceToProfitTarget = Math.max(0, targetEquity - equity);
+  const distanceToProfitTargetPercent = distanceToProfitTarget / starting * 100;
+  const currentDrawdownPercent = (highestEq - equity) / highestEq * 100;
+  const remainingSafeExposureLot = Math.max(0, rules.maxTotalExposureLot - openPositionsLot);
+  const isDefensive = remainingDailyLossBuffer < maxDailyLossAmount * 0.25 || remainingOverallDrawdownBuffer < maxOverallDrawdownAmount * 0.25;
+  let isViolated = false;
+  let violationReason = null;
+  if (currentDailyLoss >= maxDailyLossAmount) {
+    isViolated = true;
+    violationReason = `Prop rule violation: Daily loss limit hit ($${currentDailyLoss.toFixed(2)} >= $${maxDailyLossAmount.toFixed(2)})`;
+  } else if (currentOverallDrawdown >= maxOverallDrawdownAmount) {
+    isViolated = true;
+    violationReason = `Prop rule violation: Overall drawdown limit hit ($${currentOverallDrawdown.toFixed(2)} >= $${maxOverallDrawdownAmount.toFixed(2)})`;
+  }
+  return {
+    currentEquity: equity,
+    currentDrawdownPercent,
+    remainingDailyLossBuffer,
+    remainingDailyLossPercent,
+    remainingOverallDrawdownBuffer,
+    remainingOverallDrawdownPercent,
+    distanceToProfitTarget,
+    distanceToProfitTargetPercent,
+    currentExposureLot: openPositionsLot,
+    remainingSafeExposureLot,
+    isDefensive,
+    isViolated,
+    violationReason
+  };
+}
+function evaluateContestMetrics(profile, closedTrades = []) {
+  const rules = { ...getDefaultContestRules(), ...profile.contestRules };
+  const starting = profile.startingBalance || 1e4;
+  const profit = profile.currentEquity - starting;
+  const roiPercent = profit / starting * 100;
+  const totalLots = closedTrades.reduce((sum, t) => sum + (t.lot || 0), 0);
+  const tradeCount = closedTrades.length;
+  const winCount = closedTrades.filter((t) => t.isWin).length;
+  const winRatePercent = tradeCount > 0 ? winCount / tradeCount * 100 : 0;
+  const highestEq = Math.max(profile.highestEquity, profile.currentEquity, starting);
+  const maxDrawdownPercent = (highestEq - profile.currentEquity) / highestEq * 100;
+  let objectiveProgressPercent = 0;
+  switch (rules.objective) {
+    case "PROFIT":
+      objectiveProgressPercent = rules.targetProfit && rules.targetProfit > 0 ? Math.min(100, Math.max(0, profit / rules.targetProfit * 100)) : Math.max(0, roiPercent);
+      break;
+    case "ROI":
+      objectiveProgressPercent = Math.min(100, Math.max(0, roiPercent));
+      break;
+    case "VOLUME":
+    case "LOTS_TRADED":
+      objectiveProgressPercent = rules.targetLots && rules.targetLots > 0 ? Math.min(100, totalLots / rules.targetLots * 100) : 100;
+      break;
+    case "RISK_ADJUSTED_RETURN":
+      const riskAdj = maxDrawdownPercent > 0 ? roiPercent / maxDrawdownPercent : roiPercent;
+      objectiveProgressPercent = Math.min(100, Math.max(0, riskAdj * 10));
+      break;
+    default:
+      objectiveProgressPercent = Math.min(100, Math.max(0, roiPercent));
+  }
+  return {
+    objective: rules.objective,
+    profit,
+    roiPercent,
+    lotsTraded: totalLots,
+    tradeCount,
+    maxDrawdownPercent,
+    winRatePercent,
+    objectiveProgressPercent
   };
 }
 
 // src/lib/engine-scheduler.ts
 var running = false;
 var schedulerTimer;
+var accountCycleStore = /* @__PURE__ */ new Map();
+function getAccountCycleStatus(accountId, config) {
+  const activeMinutes = config?.activeMinutes ?? 45;
+  const cooldownMinutes = config?.cooldownMinutes ?? 20;
+  let store = accountCycleStore.get(accountId);
+  if (!store) {
+    store = {
+      state: "ACTIVE",
+      activeMinutes,
+      cooldownMinutes,
+      cycleStartedAt: Date.now(),
+      emergencyStop: false,
+      blockedReason: null
+    };
+    accountCycleStore.set(accountId, store);
+  }
+  if (store.emergencyStop) {
+    return {
+      state: "EMERGENCY_STOP",
+      activeMinutes: store.activeMinutes,
+      cooldownMinutes: store.cooldownMinutes,
+      currentCycleStartedAt: new Date(store.cycleStartedAt).toISOString(),
+      nextStateAt: new Date(store.cycleStartedAt).toISOString(),
+      remainingActiveSeconds: 0,
+      remainingCooldownSeconds: 0,
+      blockedReason: store.blockedReason ?? "Emergency kill switch activated",
+      emergencyStop: true
+    };
+  }
+  const now = Date.now();
+  const elapsedMinutes = (now - store.cycleStartedAt) / (1e3 * 60);
+  if (store.state === "ACTIVE") {
+    if (elapsedMinutes >= store.activeMinutes) {
+      store.state = "COOLDOWN";
+      store.cycleStartedAt = now;
+      logger.info({ accountId }, "Trading cycle transition: ACTIVE -> COOLDOWN");
+    }
+  } else if (store.state === "COOLDOWN") {
+    if (elapsedMinutes >= store.cooldownMinutes) {
+      if (store.blockedReason) {
+        store.state = "BLOCKED";
+      } else {
+        store.state = "ACTIVE";
+        store.cycleStartedAt = now;
+        logger.info({ accountId }, "Trading cycle transition: COOLDOWN -> ACTIVE (Safety passed)");
+      }
+    }
+  } else if (store.state === "BLOCKED") {
+    if (!store.blockedReason) {
+      store.state = "ACTIVE";
+      store.cycleStartedAt = now;
+    }
+  }
+  const currentElapsedSec = Math.floor((now - store.cycleStartedAt) / 1e3);
+  let remainingActiveSeconds = 0;
+  let remainingCooldownSeconds = 0;
+  let nextStateAtMs = store.cycleStartedAt;
+  if (store.state === "ACTIVE") {
+    const totalActiveSec = store.activeMinutes * 60;
+    remainingActiveSeconds = Math.max(0, totalActiveSec - currentElapsedSec);
+    nextStateAtMs = store.cycleStartedAt + totalActiveSec * 1e3;
+  } else if (store.state === "COOLDOWN") {
+    const totalCooldownSec = store.cooldownMinutes * 60;
+    remainingCooldownSeconds = Math.max(0, totalCooldownSec - currentElapsedSec);
+    nextStateAtMs = store.cycleStartedAt + totalCooldownSec * 1e3;
+  }
+  return {
+    state: store.state,
+    activeMinutes: store.activeMinutes,
+    cooldownMinutes: store.cooldownMinutes,
+    currentCycleStartedAt: new Date(store.cycleStartedAt).toISOString(),
+    nextStateAt: new Date(nextStateAtMs).toISOString(),
+    remainingActiveSeconds,
+    remainingCooldownSeconds,
+    blockedReason: store.blockedReason,
+    emergencyStop: store.emergencyStop
+  };
+}
+function setEmergencyKillSwitch(accountId, enabled, reason = "Emergency kill switch engaged") {
+  let store = accountCycleStore.get(accountId);
+  if (!store) {
+    store = {
+      state: enabled ? "EMERGENCY_STOP" : "ACTIVE",
+      activeMinutes: 45,
+      cooldownMinutes: 20,
+      cycleStartedAt: Date.now(),
+      emergencyStop: enabled,
+      blockedReason: enabled ? reason : null
+    };
+    accountCycleStore.set(accountId, store);
+  } else {
+    store.emergencyStop = enabled;
+    if (enabled) {
+      store.state = "EMERGENCY_STOP";
+      store.blockedReason = reason;
+    } else {
+      store.state = "ACTIVE";
+      store.cycleStartedAt = Date.now();
+      store.blockedReason = null;
+    }
+  }
+}
+function updateAccountCycleConfig(accountId, config) {
+  let store = accountCycleStore.get(accountId);
+  if (!store) {
+    store = {
+      state: "ACTIVE",
+      activeMinutes: config.activeMinutes ?? 45,
+      cooldownMinutes: config.cooldownMinutes ?? 20,
+      cycleStartedAt: Date.now(),
+      emergencyStop: false,
+      blockedReason: null
+    };
+    accountCycleStore.set(accountId, store);
+  } else {
+    if (config.activeMinutes) store.activeMinutes = config.activeMinutes;
+    if (config.cooldownMinutes) store.cooldownMinutes = config.cooldownMinutes;
+  }
+}
 function numberValue(value) {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
@@ -33865,7 +34332,7 @@ function findLivePosition(row, positions) {
     }
     const entry = numberValue(row.entry);
     const lot = numberValue(row.lot);
-    return entry !== null && position.openPrice !== null && position.volume !== null && Math.abs(position.openPrice - entry) < 5e-4 && (lot === null || Math.abs(position.volume - lot) < 1e-6);
+    return entry !== null && position.openPrice !== null && position.openPrice !== void 0 && position.volume !== null && position.volume !== void 0 && Math.abs(position.openPrice - entry) < 5e-4 && (lot === null || Math.abs(position.volume - lot) < 1e-6);
   });
   return candidates.length === 1 ? candidates[0] : void 0;
 }
@@ -33923,7 +34390,7 @@ function shouldMoveToBreakEven(row, position) {
   const direction = String(row.direction ?? "").toUpperCase();
   const r = direction === "SELL" ? (entry - currentPrice) / risk : (currentPrice - entry) / risk;
   if (r < 1) return false;
-  if (position.stopLoss === null) return true;
+  if (position.stopLoss === null || position.stopLoss === void 0) return true;
   return direction === "SELL" ? position.stopLoss > entry : position.stopLoss < entry;
 }
 function hasChanges(row, patch) {
@@ -33986,13 +34453,13 @@ async function reconcileAccountJournal(accountId, metaApiAccountId, metadata = {
     const position = findLivePosition(row, live.positions);
     if (position) {
       if (shouldMoveToBreakEven(row, position) && position.id) {
-        const entryPrice = numberValue(row.entry) ?? position.openPrice;
+        const entryPrice = numberValue(row.entry) ?? position.openPrice ?? null;
         if (entryPrice === null) continue;
         await moveMetaApiPositionStopToBreakEven({
           accountId: metaApiAccountId,
           positionId: position.id,
           entryPrice,
-          takeProfit: position.takeProfit
+          takeProfit: position.takeProfit ?? null
         });
         breakEvenMoves += 1;
       }
@@ -34033,12 +34500,36 @@ async function runScheduledAnalysis() {
   running = true;
   try {
     const profiles = await supabaseRequest("profiles", {
-      query: { select: "id,metaapi_account_id", limit: 100 }
+      query: { select: "id,metaapi_account_id,mode,starting_balance,balance,equity,highest_equity,daily_starting_equity", limit: 100 }
     });
     await Promise.all(
       profiles.filter(
         (profile) => typeof profile.id === "string" && typeof profile.metaapi_account_id === "string"
       ).map(async (profile) => {
+        const cycleStatus = getAccountCycleStatus(profile.id);
+        let blockedReason = null;
+        if (profile.mode === "PROP") {
+          const accProf = {
+            id: profile.id,
+            mode: "PROP",
+            startingBalance: profile.starting_balance ?? 1e5,
+            currentBalance: profile.balance ?? 1e5,
+            currentEquity: profile.equity ?? 1e5,
+            highestEquity: profile.highest_equity ?? 1e5,
+            dailyStartingEquity: profile.daily_starting_equity ?? 1e5
+          };
+          const propSafety = evaluatePropSafety(accProf);
+          if (propSafety.isViolated) {
+            blockedReason = propSafety.violationReason;
+          }
+        }
+        const cycleStore = accountCycleStore.get(profile.id);
+        if (cycleStore) {
+          cycleStore.blockedReason = blockedReason;
+          if (blockedReason && cycleStore.state !== "EMERGENCY_STOP") {
+            cycleStore.state = "BLOCKED";
+          }
+        }
         await Promise.all(
           SUPPORTED_SYMBOLS.map(async (symbol) => {
             try {
@@ -34158,6 +34649,10 @@ function emptySnapshot(diagnostics) {
     dailyPnlPercent: null,
     winRate: null,
     profitFactor: null,
+    cycleStatus: null,
+    accountProfile: null,
+    propSafety: null,
+    contestMetrics: null,
     states: [],
     journal: [],
     equityHistory: [],
@@ -34169,6 +34664,7 @@ function emptySnapshot(diagnostics) {
 router3.get("/dashboard", async (req, res) => {
   try {
     const { accountId } = GetDashboardQueryParams.parse(req.query);
+    const cycleStatus = getAccountCycleStatus(accountId);
     if (!hasSupabaseConfig()) {
       res.json(
         emptySnapshot([
@@ -34213,12 +34709,33 @@ router3.get("/dashboard", async (req, res) => {
     const grossLoss = Math.abs(
       closed.filter((entry) => (entry.pnl ?? 0) < 0).reduce((sum, entry) => sum + (entry.pnl ?? 0), 0)
     );
+    const mode = typeof profile.mode === "string" ? profile.mode : "DEMO";
+    const accountProfile = {
+      id: accountId,
+      mode,
+      startingBalance: typeof profile.starting_balance === "number" ? profile.starting_balance : account.balance ?? 1e4,
+      currentBalance: account.balance ?? 1e4,
+      currentEquity: account.equity ?? 1e4,
+      highestEquity: typeof profile.highest_equity === "number" ? profile.highest_equity : account.equity ?? 1e4,
+      dailyStartingEquity: typeof profile.daily_starting_equity === "number" ? profile.daily_starting_equity : account.equity ?? 1e4,
+      propRules: getDefaultPropRules(typeof profile.starting_balance === "number" ? profile.starting_balance : 1e5)
+    };
+    const openPositionsLot = account.positions.reduce((sum, p) => sum + (p.volume ?? 0), 0);
+    const propSafety = mode === "PROP" ? evaluatePropSafety(accountProfile, openPositionsLot) : null;
+    const contestMetrics = mode === "CONTEST" ? evaluateContestMetrics(
+      accountProfile,
+      closed.map((c) => ({ pnl: c.pnl ?? 0, lot: c.lot ?? 0, isWin: (c.pnl ?? 0) > 0 }))
+    ) : null;
     res.json({
       account,
       dailyPnl: null,
       dailyPnlPercent: null,
       winRate: closed.length ? winners.length / closed.length * 100 : null,
       profitFactor: grossLoss ? grossProfit / grossLoss : null,
+      cycleStatus,
+      accountProfile,
+      propSafety,
+      contestMetrics,
       states: states.map(mapState),
       journal,
       equityHistory: equityRows.map((row) => ({
@@ -34240,6 +34757,51 @@ router3.get("/dashboard", async (req, res) => {
   } catch (error) {
     res.status(400).json({
       error: error instanceof Error ? error.message : "Unable to load dashboard"
+    });
+  }
+});
+router3.post("/dashboard/kill-switch", async (req, res) => {
+  try {
+    const accountId = String(req.body?.accountId ?? "").trim();
+    const enabled = Boolean(req.body?.enabled);
+    const reason = String(req.body?.reason ?? "Manual kill switch triggered").trim();
+    if (!accountId) {
+      res.status(400).json({ error: "accountId is required" });
+      return;
+    }
+    setEmergencyKillSwitch(accountId, enabled, reason);
+    res.json({
+      accountId,
+      enabled,
+      reason,
+      status: getAccountCycleStatus(accountId)
+    });
+  } catch (error) {
+    res.status(400).json({
+      error: error instanceof Error ? error.message : "Unable to toggle kill switch"
+    });
+  }
+});
+router3.post("/dashboard/cycle-config", async (req, res) => {
+  try {
+    const accountId = String(req.body?.accountId ?? "").trim();
+    const activeMinutes = Number(req.body?.activeMinutes);
+    const cooldownMinutes = Number(req.body?.cooldownMinutes);
+    if (!accountId) {
+      res.status(400).json({ error: "accountId is required" });
+      return;
+    }
+    updateAccountCycleConfig(accountId, {
+      activeMinutes: Number.isFinite(activeMinutes) && activeMinutes > 0 ? activeMinutes : void 0,
+      cooldownMinutes: Number.isFinite(cooldownMinutes) && cooldownMinutes > 0 ? cooldownMinutes : void 0
+    });
+    res.json({
+      accountId,
+      status: getAccountCycleStatus(accountId)
+    });
+  } catch (error) {
+    res.status(400).json({
+      error: error instanceof Error ? error.message : "Unable to update cycle config"
     });
   }
 });
@@ -34376,27 +34938,35 @@ function currenciesForSymbol(symbol) {
 }
 async function hasHighImpactNewsWithin(symbol, minutes) {
   const token = process.env.FINNHUB_API_KEY;
-  if (!token) throw new Error("Add FINNHUB_API_KEY in Secrets");
+  if (!token) {
+    logger.warn("FINNHUB_API_KEY missing; skipping news blackout filter");
+    return { blocked: false, event: null, warning: "Missing FINNHUB_API_KEY" };
+  }
   const now = /* @__PURE__ */ new Date();
   const end = new Date(now.getTime() + minutes * 6e4);
   const from = now.toISOString().slice(0, 10);
   const to = end.toISOString().slice(0, 10);
-  const response = await fetch(
-    `https://finnhub.io/api/v1/calendar/economic?from=${from}&to=${to}&token=${encodeURIComponent(token)}`
-  );
-  if (!response.ok) {
-    logger.warn({ status: response.status }, "Finnhub calendar request failed");
-    throw new Error("Finnhub news filter request failed");
+  try {
+    const response = await fetch(
+      `https://finnhub.io/api/v1/calendar/economic?from=${from}&to=${to}&token=${encodeURIComponent(token)}`
+    );
+    if (!response.ok) {
+      logger.warn({ status: response.status }, "Finnhub calendar request failed");
+      return { blocked: false, event: null, warning: "News service unavailable" };
+    }
+    const payload = await response.json();
+    const currencies = currenciesForSymbol(symbol);
+    const nowMs = now.getTime();
+    const windowMs = minutes * 6e4;
+    const event = (payload.economicCalendar ?? []).find((candidate) => {
+      const timeMs = candidate.time ? new Date(candidate.time).getTime() : NaN;
+      return candidate.impact?.toLowerCase() === "high" && currencies.includes(candidate.country ?? "") && Number.isFinite(timeMs) && Math.abs(timeMs - nowMs) <= windowMs;
+    });
+    return event ? { blocked: true, event: event.event ?? "High impact event" } : { blocked: false, event: null };
+  } catch (error) {
+    logger.warn({ error }, "Error querying Finnhub economic calendar");
+    return { blocked: false, event: null, warning: "News service error" };
   }
-  const payload = await response.json();
-  const currencies = currenciesForSymbol(symbol);
-  const nowMs = now.getTime();
-  const windowMs = minutes * 6e4;
-  const event = (payload.economicCalendar ?? []).find((candidate) => {
-    const timeMs = candidate.time ? new Date(candidate.time).getTime() : NaN;
-    return candidate.impact?.toLowerCase() === "high" && currencies.includes(candidate.country ?? "") && Number.isFinite(timeMs) && Math.abs(timeMs - nowMs) <= windowMs;
-  });
-  return event ? { blocked: true, event: event.event ?? "High impact event" } : { blocked: false, event: null };
 }
 
 // src/routes/engine.ts
@@ -34943,22 +35513,14 @@ app.use("/api", routes_default);
 var app_default = app;
 
 // src/index.ts
-var rawPort = process.env["PORT"];
-if (!rawPort) {
-  throw new Error(
-    "PORT environment variable is required but was not provided."
-  );
-}
+var rawPort = process.env["PORT"] || "3000";
 var port = Number(rawPort);
 if (Number.isNaN(port) || port <= 0) {
   throw new Error(`Invalid PORT value: "${rawPort}"`);
 }
-var server = app_default.listen(port, (err) => {
-  if (err) {
-    logger.error({ err }, "Error listening on port");
-    process.exit(1);
-  }
-  logger.info({ port }, "Server listening");
+var host = "0.0.0.0";
+var server = app_default.listen(port, host, () => {
+  logger.info({ port, host }, "Server listening on 0.0.0.0");
   startEngineScheduler();
 });
 var shuttingDown = false;

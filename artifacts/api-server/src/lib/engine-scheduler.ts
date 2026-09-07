@@ -6,10 +6,175 @@ import {
   type MetaApiHistoryDeal,
 } from "./metaapi";
 import { analyzeSymbol, SUPPORTED_SYMBOLS } from "./strategy";
-import { hasSupabaseConfig, supabaseRequest } from "./supabase";
+import { hasSupabaseConfig, supabaseRequest, findProfile } from "./supabase";
+import {
+  evaluatePropSafety,
+  evaluateContestMetrics,
+  type AccountProfile,
+  type AccountProfileMode,
+} from "./account-profile";
+import { hasHighImpactNewsWithin } from "./market";
 
 let running = false;
 let schedulerTimer: ReturnType<typeof setInterval> | undefined;
+
+export type EngineCycleState = "ACTIVE" | "COOLDOWN" | "BLOCKED" | "EMERGENCY_STOP";
+
+export type TradingCycleConfig = {
+  activeMinutes: number; // default 45
+  cooldownMinutes: number; // default 20
+};
+
+export type CycleStatus = {
+  state: EngineCycleState;
+  activeMinutes: number;
+  cooldownMinutes: number;
+  currentCycleStartedAt: string;
+  nextStateAt: string;
+  remainingActiveSeconds: number;
+  remainingCooldownSeconds: number;
+  blockedReason: string | null;
+  emergencyStop: boolean;
+};
+
+const accountCycleStore = new Map<string, {
+  state: EngineCycleState;
+  activeMinutes: number;
+  cooldownMinutes: number;
+  cycleStartedAt: number; // timestamp ms
+  emergencyStop: boolean;
+  blockedReason: string | null;
+}>();
+
+export function getAccountCycleStatus(accountId: string, config?: Partial<TradingCycleConfig>): CycleStatus {
+  const activeMinutes = config?.activeMinutes ?? 45;
+  const cooldownMinutes = config?.cooldownMinutes ?? 20;
+
+  let store = accountCycleStore.get(accountId);
+  if (!store) {
+    store = {
+      state: "ACTIVE",
+      activeMinutes,
+      cooldownMinutes,
+      cycleStartedAt: Date.now(),
+      emergencyStop: false,
+      blockedReason: null,
+    };
+    accountCycleStore.set(accountId, store);
+  }
+
+  if (store.emergencyStop) {
+    return {
+      state: "EMERGENCY_STOP",
+      activeMinutes: store.activeMinutes,
+      cooldownMinutes: store.cooldownMinutes,
+      currentCycleStartedAt: new Date(store.cycleStartedAt).toISOString(),
+      nextStateAt: new Date(store.cycleStartedAt).toISOString(),
+      remainingActiveSeconds: 0,
+      remainingCooldownSeconds: 0,
+      blockedReason: store.blockedReason ?? "Emergency kill switch activated",
+      emergencyStop: true,
+    };
+  }
+
+  const now = Date.now();
+  const elapsedMinutes = (now - store.cycleStartedAt) / (1000 * 60);
+
+  if (store.state === "ACTIVE") {
+    if (elapsedMinutes >= store.activeMinutes) {
+      // Transition to COOLDOWN
+      store.state = "COOLDOWN";
+      store.cycleStartedAt = now;
+      logger.info({ accountId }, "Trading cycle transition: ACTIVE -> COOLDOWN");
+    }
+  } else if (store.state === "COOLDOWN") {
+    if (elapsedMinutes >= store.cooldownMinutes) {
+      // Safety Check before resuming ACTIVE
+      if (store.blockedReason) {
+        store.state = "BLOCKED";
+      } else {
+        store.state = "ACTIVE";
+        store.cycleStartedAt = now;
+        logger.info({ accountId }, "Trading cycle transition: COOLDOWN -> ACTIVE (Safety passed)");
+      }
+    }
+  } else if (store.state === "BLOCKED") {
+    if (!store.blockedReason) {
+      store.state = "ACTIVE";
+      store.cycleStartedAt = now;
+    }
+  }
+
+  const currentElapsedSec = Math.floor((now - store.cycleStartedAt) / 1000);
+  let remainingActiveSeconds = 0;
+  let remainingCooldownSeconds = 0;
+  let nextStateAtMs = store.cycleStartedAt;
+
+  if (store.state === "ACTIVE") {
+    const totalActiveSec = store.activeMinutes * 60;
+    remainingActiveSeconds = Math.max(0, totalActiveSec - currentElapsedSec);
+    nextStateAtMs = store.cycleStartedAt + totalActiveSec * 1000;
+  } else if (store.state === "COOLDOWN") {
+    const totalCooldownSec = store.cooldownMinutes * 60;
+    remainingCooldownSeconds = Math.max(0, totalCooldownSec - currentElapsedSec);
+    nextStateAtMs = store.cycleStartedAt + totalCooldownSec * 1000;
+  }
+
+  return {
+    state: store.state,
+    activeMinutes: store.activeMinutes,
+    cooldownMinutes: store.cooldownMinutes,
+    currentCycleStartedAt: new Date(store.cycleStartedAt).toISOString(),
+    nextStateAt: new Date(nextStateAtMs).toISOString(),
+    remainingActiveSeconds,
+    remainingCooldownSeconds,
+    blockedReason: store.blockedReason,
+    emergencyStop: store.emergencyStop,
+  };
+}
+
+export function setEmergencyKillSwitch(accountId: string, enabled: boolean, reason = "Emergency kill switch engaged") {
+  let store = accountCycleStore.get(accountId);
+  if (!store) {
+    store = {
+      state: enabled ? "EMERGENCY_STOP" : "ACTIVE",
+      activeMinutes: 45,
+      cooldownMinutes: 20,
+      cycleStartedAt: Date.now(),
+      emergencyStop: enabled,
+      blockedReason: enabled ? reason : null,
+    };
+    accountCycleStore.set(accountId, store);
+  } else {
+    store.emergencyStop = enabled;
+    if (enabled) {
+      store.state = "EMERGENCY_STOP";
+      store.blockedReason = reason;
+    } else {
+      store.state = "ACTIVE";
+      store.cycleStartedAt = Date.now();
+      store.blockedReason = null;
+    }
+  }
+}
+
+export function updateAccountCycleConfig(accountId: string, config: Partial<TradingCycleConfig>) {
+  let store = accountCycleStore.get(accountId);
+  if (!store) {
+    store = {
+      state: "ACTIVE",
+      activeMinutes: config.activeMinutes ?? 45,
+      cooldownMinutes: config.cooldownMinutes ?? 20,
+      cycleStartedAt: Date.now(),
+      emergencyStop: false,
+      blockedReason: null,
+    };
+    accountCycleStore.set(accountId, store);
+  } else {
+    if (config.activeMinutes) store.activeMinutes = config.activeMinutes;
+    if (config.cooldownMinutes) store.cooldownMinutes = config.cooldownMinutes;
+  }
+}
 
 type JournalRow = Record<string, unknown> & {
   id?: string;
@@ -62,7 +227,9 @@ function findLivePosition(
     return (
       entry !== null &&
       position.openPrice !== null &&
+      position.openPrice !== undefined &&
       position.volume !== null &&
+      position.volume !== undefined &&
       Math.abs(position.openPrice - entry) < 0.0005 &&
       (lot === null || Math.abs(position.volume - lot) < 0.000001)
     );
@@ -146,7 +313,7 @@ function shouldMoveToBreakEven(
   const direction = String(row.direction ?? "").toUpperCase();
   const r = direction === "SELL" ? (entry - currentPrice) / risk : (currentPrice - entry) / risk;
   if (r < 1) return false;
-  if (position.stopLoss === null) return true;
+  if (position.stopLoss === null || position.stopLoss === undefined) return true;
   return direction === "SELL" ? position.stopLoss > entry : position.stopLoss < entry;
 }
 
@@ -220,13 +387,13 @@ export async function reconcileAccountJournal(
     const position = findLivePosition(row, live.positions);
     if (position) {
       if (shouldMoveToBreakEven(row, position) && position.id) {
-        const entryPrice = numberValue(row.entry) ?? position.openPrice;
+        const entryPrice = numberValue(row.entry) ?? position.openPrice ?? null;
         if (entryPrice === null) continue;
         await moveMetaApiPositionStopToBreakEven({
           accountId: metaApiAccountId,
           positionId: position.id,
           entryPrice,
-          takeProfit: position.takeProfit,
+          takeProfit: position.takeProfit ?? null,
         });
         breakEvenMoves += 1;
       }
@@ -279,18 +446,67 @@ async function runScheduledAnalysis() {
   running = true;
   try {
     const profiles = await supabaseRequest<
-      Array<{ id?: string; metaapi_account_id?: string }>
+      Array<{
+        id?: string;
+        metaapi_account_id?: string;
+        mode?: AccountProfileMode;
+        starting_balance?: number;
+        balance?: number;
+        equity?: number;
+        highest_equity?: number;
+        daily_starting_equity?: number;
+      }>
     >("profiles", {
-      query: { select: "id,metaapi_account_id", limit: 100 },
+      query: { select: "id,metaapi_account_id,mode,starting_balance,balance,equity,highest_equity,daily_starting_equity", limit: 100 },
     });
+
     await Promise.all(
       profiles
         .filter(
-          (profile): profile is { id: string; metaapi_account_id: string } =>
+          (profile): profile is {
+            id: string;
+            metaapi_account_id: string;
+            mode?: AccountProfileMode;
+            starting_balance?: number;
+            balance?: number;
+            equity?: number;
+            highest_equity?: number;
+            daily_starting_equity?: number;
+          } =>
             typeof profile.id === "string" &&
             typeof profile.metaapi_account_id === "string",
         )
         .map(async (profile) => {
+          const cycleStatus = getAccountCycleStatus(profile.id);
+
+          // Safety Checks on Prop Profile
+          let blockedReason: string | null = null;
+          if (profile.mode === "PROP") {
+            const accProf: AccountProfile = {
+              id: profile.id,
+              mode: "PROP",
+              startingBalance: profile.starting_balance ?? 100000,
+              currentBalance: profile.balance ?? 100000,
+              currentEquity: profile.equity ?? 100000,
+              highestEquity: profile.highest_equity ?? 100000,
+              dailyStartingEquity: profile.daily_starting_equity ?? 100000,
+            };
+            const propSafety = evaluatePropSafety(accProf);
+            if (propSafety.isViolated) {
+              blockedReason = propSafety.violationReason;
+            }
+          }
+
+          // Cycle Safety Override Update
+          const cycleStore = accountCycleStore.get(profile.id);
+          if (cycleStore) {
+            cycleStore.blockedReason = blockedReason;
+            if (blockedReason && cycleStore.state !== "EMERGENCY_STOP") {
+              cycleStore.state = "BLOCKED";
+            }
+          }
+
+          // In both ACTIVE and COOLDOWN modes, scan market & update strategy states
           await Promise.all(
             SUPPORTED_SYMBOLS.map(async (symbol) => {
               try {
@@ -319,6 +535,8 @@ async function runScheduledAnalysis() {
               }
             }),
           );
+
+          // In both ACTIVE and COOLDOWN modes, manage existing positions & reconcile journal
           try {
             const result = await reconcileAccountJournal(
               profile.id,

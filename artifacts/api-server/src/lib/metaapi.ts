@@ -23,7 +23,19 @@ type MetaApiAccountInfo = {
   marginLevel?: number;
 };
 
-type MetaApiPosition = Record<string, unknown>;
+export type MetaApiPosition = Record<string, unknown> & {
+  id?: string | null;
+  symbol?: string | null;
+  type?: string | null;
+  volume?: number | null;
+  openPrice?: number | null;
+  currentPrice?: number | null;
+  stopLoss?: number | null;
+  takeProfit?: number | null;
+  profit?: number | null;
+  swap?: number | null;
+  time?: string | null;
+};
 
 export type MetaApiSymbolPrice = {
   symbol: string;
@@ -261,7 +273,7 @@ export async function connectMetaApiAccount(input: {
   });
 }
 
-function mapPosition(position: MetaApiPosition) {
+function mapPosition(position: Record<string, unknown>): MetaApiPosition {
   const openPrice =
     typeof position.openPrice === "number"
       ? position.openPrice
@@ -270,14 +282,14 @@ function mapPosition(position: MetaApiPosition) {
         : null;
   return {
     id: typeof position.id === "string" ? position.id : null,
-     symbol: typeof position.symbol === "string" ? position.symbol : null,
-     type: typeof position.type === "string" ? position.type : null,
+    symbol: typeof position.symbol === "string" ? position.symbol : null,
+    type: typeof position.type === "string" ? position.type : null,
     volume:
       typeof position.volume === "number"
         ? position.volume
         : typeof position.currentVolume === "number"
           ? position.currentVolume
-           : null,
+          : null,
     openPrice,
     currentPrice:
       typeof position.currentPrice === "number"
@@ -303,7 +315,7 @@ export async function getLiveAccountSnapshot(
       CLIENT_API,
       `/users/current/accounts/${encodeURIComponent(accountId)}/accountInformation`,
     ),
-    metaapiFetch<MetaApiPosition[]>(
+    metaapiFetch<Array<Record<string, unknown>>>(
       CLIENT_API,
       `/users/current/accounts/${encodeURIComponent(accountId)}/positions`,
     ),
@@ -489,6 +501,28 @@ export async function getMetaApiHistoryDeals(
   }));
 }
 
+export async function modifyMetaApiPosition(input: {
+  accountId: string;
+  positionId: string;
+  stopLoss: number | null;
+  takeProfit: number | null;
+}) {
+  return metaapiFetch<Record<string, unknown>>(
+    CLIENT_API,
+    `/users/current/accounts/${encodeURIComponent(input.accountId)}/trade`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        actionType: "POSITION_MODIFY_ID",
+        positionId: input.positionId,
+        stopLoss: input.stopLoss,
+        takeProfit: input.takeProfit,
+        comment: "MH-V2 PROTECTION CORRECTION",
+      }),
+    },
+  );
+}
+
 export async function moveMetaApiPositionStopToBreakEven(input: {
   accountId: string;
   positionId: string;
@@ -511,9 +545,9 @@ export async function moveMetaApiPositionStopToBreakEven(input: {
   );
 }
 
-export async function closeAllMetaApiPositions(accountId: string, positions: Array<{ id: string | null }>) {
+export async function closeAllMetaApiPositions(accountId: string, positions: Array<{ id?: string | null }>) {
   haltTrading(accountId);
-  const closable = positions.filter((position): position is { id: string } => Boolean(position.id));
+  const closable = positions.filter((position): position is { id: string } => typeof position.id === "string" && Boolean(position.id));
   const outcomes = await Promise.all(
     closable.map(async (position) => {
       try {
@@ -544,7 +578,7 @@ export async function closeAllMetaApiPositions(accountId: string, positions: Arr
     const verified = await getLiveAccountSnapshot(accountId);
     remaining = verified.positions
       .map((position) => position.id)
-      .filter((id): id is string => Boolean(id));
+      .filter((id): id is string => typeof id === "string" && Boolean(id));
     if (!remaining.length) clearTradingHalt(accountId);
   } catch {
     // Keep the halt active when flatness cannot be verified.
