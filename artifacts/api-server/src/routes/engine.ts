@@ -5,7 +5,6 @@ import {
   RunEngineBody,
 } from "@workspace/api-zod";
 import {
-  executeMetaApiTrade,
   getHistoricalCandles,
   getLiveAccountSnapshot,
   getMetaApiSymbolPrice,
@@ -14,7 +13,8 @@ import {
   resolveMetaApiSymbol,
 } from "../lib/metaapi";
 import { runBacktest } from "../lib/backtest";
-import { hasHighImpactNewsWithin } from "../lib/market";
+import { evaluateTradeRisk } from "../lib/risk-engine";
+import { runPostExecutionPipeline } from "../lib/execution-pipeline";
 import { analyzeSymbol, SUPPORTED_SYMBOLS } from "../lib/strategy";
 import { findProfile, supabaseRequest } from "../lib/supabase";
 
@@ -200,75 +200,6 @@ router.post("/engine/backtest", async (req, res) => {
   }
 });
 
-function contractSize(symbol: string) {
-  if (symbol.startsWith("XAU")) return 100;
-  if (symbol.startsWith("NAS") || symbol.startsWith("US")) return 1;
-  return 100_000;
-}
-
-function pipValue(symbol: string) {
-  if (symbol.startsWith("XAU")) return 10;
-  if (symbol.startsWith("NAS") || symbol.startsWith("US")) return 1;
-  return 10;
-}
-
-function roundLot(value: number) {
-  return Math.max(0.01, Math.floor(value * 100) / 100);
-}
-
-async function tradeGate(
-  accountId: string,
-  symbol: string,
-  risk: Record<string, unknown>,
-  positions: Array<{ symbol: string }>,
-) {
-  const diagnostics: string[] = [];
-  if (positions.some((position) => position.symbol === symbol)) {
-    diagnostics.push("Duplicate symbol blocked");
-  }
-  const groups = [
-    ["XAUUSD", "NAS100", "US30"],
-    ["EURUSD", "GBPUSD"],
-  ];
-  const group = groups.find((members) => members.includes(symbol));
-  if (group && positions.filter((position) => group.includes(position.symbol)).length >= 2) {
-    diagnostics.push("Correlated position limit reached");
-  }
-  const day = new Date();
-  if (day.getUTCDay() === 5 && (day.getUTCHours() > 21 || (day.getUTCHours() === 21 && day.getUTCMinutes() >= 45))) {
-    diagnostics.push("Friday 21:45 GMT close — no new trades");
-  }
-  const journalRows = await supabaseRequest<Record<string, unknown>[]>("journal", {
-    query: {
-      select: "pnl,status,created_at",
-      account_id: `eq.${accountId}`,
-      status: "eq.CLOSED",
-      order: "created_at.desc",
-      limit: 500,
-    },
-  });
-  const now = Date.now();
-  const dayPnl = journalRows
-    .filter((row) => now - new Date(String(row.created_at ?? 0)).getTime() <= 86_400_000)
-    .reduce((sum, row) => sum + Number(row.pnl ?? 0), 0);
-  const weekPnl = journalRows
-    .filter((row) => now - new Date(String(row.created_at ?? 0)).getTime() <= 7 * 86_400_000)
-    .reduce((sum, row) => sum + Number(row.pnl ?? 0), 0);
-  const equity = Number(risk.__equity ?? 0);
-  if (equity > 0 && dayPnl <= -(equity * Number(risk.daily_loss ?? 3)) / 100) {
-    diagnostics.push(`Daily loss limit reached (${risk.daily_loss ?? 3}%)`);
-  }
-  if (equity > 0 && weekPnl <= -(equity * Number(risk.weekly_loss ?? 6)) / 100) {
-    diagnostics.push(`Weekly loss limit reached (${risk.weekly_loss ?? 6}%)`);
-  }
-  const news = await hasHighImpactNewsWithin(
-    symbol,
-    Number(risk.news_minutes ?? 30),
-  );
-  if (news.blocked) diagnostics.push(`High-impact news blocked: ${news.event}`);
-  return diagnostics;
-}
-
 router.post("/engine/execute", async (req, res) => {
   try {
     const input = ExecuteTradeBody.parse(req.body);
@@ -276,47 +207,42 @@ router.post("/engine/execute", async (req, res) => {
     const riskRows = await supabaseRequest<Record<string, unknown>[]>("risk_settings", {
       query: { select: "*", account_id: `eq.${input.accountId}`, limit: 1 },
     });
-    const risk = riskRows[0] ?? {
-      risk_per_trade: 1,
-      daily_loss: 3,
-      weekly_loss: 6,
-      news_minutes: 30,
+    const riskRow = riskRows[0] ?? {};
+    const riskSettings = {
+      riskPerTrade: Number(riskRow.risk_per_trade ?? 1),
+      dailyLoss: Number(riskRow.daily_loss ?? 3),
+      weeklyLoss: Number(riskRow.weekly_loss ?? 6),
+      spreadMultiplier: Number(riskRow.spread_multiplier ?? 2.5),
+      newsMinutes: Number(riskRow.news_minutes ?? 30),
     };
-    const live = await getLiveAccountSnapshot(input.accountId, {
-      brokerName: typeof profile?.broker_name === "string" ? profile.broker_name : undefined,
-      server: typeof profile?.server === "string" ? profile.server : undefined,
-    });
+
     if (isTradingHalted(input.accountId)) {
       res.status(409).json({ error: "Trading halted by emergency stop; reconnect and explicitly re-arm the account" });
       return;
     }
-    if (!live.connected || !live.leverage || !live.equity) {
-      res.status(409).json({ error: "Real broker leverage and equity are required before trading" });
+
+    const live = await getLiveAccountSnapshot(input.accountId, {
+      brokerName: typeof profile?.broker_name === "string" ? profile.broker_name : undefined,
+      server: typeof profile?.server === "string" ? profile.server : undefined,
+    });
+
+    if (!live.connected || !live.leverage || !live.equity || !live.balance) {
+      res.status(409).json({ error: "Real broker connection, leverage, balance, and equity are required before trading" });
       return;
     }
-    const diagnostics = await tradeGate(
-      input.accountId,
-      input.symbol,
-      { ...risk, __equity: live.equity },
-      live.positions.filter(
-        (position): position is typeof position & { symbol: string } =>
-          typeof position.symbol === "string",
-      ),
-    );
-    if (diagnostics.length) {
-      res.status(409).json({ error: diagnostics.join("; ") });
-      return;
-    }
+
     const realSymbol = await resolveMetaApiSymbol(
       input.accountId,
       input.symbol,
       input.realSymbol,
     );
+
     const [price, specification, candles] = await Promise.all([
       getMetaApiSymbolPrice(input.accountId, realSymbol),
       getMetaApiSymbolSpecification(input.accountId, realSymbol),
       getHistoricalCandles(input.accountId, realSymbol, "15m", 40),
     ]);
+
     const tickTime = price.time ? new Date(price.time).getTime() : NaN;
     if (
       price.bid === null ||
@@ -327,6 +253,7 @@ router.post("/engine/execute", async (req, res) => {
       res.status(409).json({ error: "Live bid/ask data is missing or stale; order blocked" });
       return;
     }
+
     if (
       specification.tickSize === null ||
       specification.tickValue === null ||
@@ -338,10 +265,47 @@ router.post("/engine/execute", async (req, res) => {
       res.status(409).json({ error: "Broker symbol specification is incomplete; order blocked" });
       return;
     }
+
     if (specification.tradeMode && /DISABLED|CLOSEONLY/i.test(specification.tradeMode)) {
       res.status(409).json({ error: `Broker market status blocks trading: ${specification.tradeMode}` });
       return;
     }
+
+    const averageAtr =
+      candles.length > 15
+        ? candles.slice(-14).reduce((sum, candle) => sum + candle.high - candle.low, 0) / 14
+        : 0;
+
+    const spread = price.ask - price.bid;
+    const maxSpread = Math.max(specification.tickSize, averageAtr * 0.1) *
+      riskSettings.spreadMultiplier;
+
+    // Authoritative Pre-Trade Risk Gate Call
+    const riskCheck = await evaluateTradeRisk({
+      accountId: input.accountId,
+      symbol: input.symbol,
+      direction: input.direction,
+      equity: live.equity,
+      balance: live.balance,
+      freeMargin: live.freeMargin,
+      openPositions: live.positions.map((p) => ({
+        id: p.id ?? undefined,
+        symbol: p.symbol ?? input.symbol,
+        volume: p.volume,
+        openPrice: p.openPrice,
+      })),
+      spreadInfo: {
+        currentSpread: spread,
+        maxAllowedSpread: maxSpread,
+      },
+      riskSettings,
+    });
+
+    if (!riskCheck.passed) {
+      res.status(409).json({ error: riskCheck.violations.join("; ") });
+      return;
+    }
+
     const entryPrice = input.direction === "BUY" ? price.ask : price.bid;
     if (input.direction === "BUY" && (input.sl >= entryPrice || input.tp <= entryPrice)) {
       res.status(409).json({ error: "BUY orders require SL below and TP above the live ask" });
@@ -351,44 +315,33 @@ router.post("/engine/execute", async (req, res) => {
       res.status(409).json({ error: "SELL orders require SL above and TP below the live bid" });
       return;
     }
-    const last = candles.slice(0, -1).at(-1);
-    const averageAtr =
-      candles.length > 15
-        ? candles.slice(-14).reduce((sum, candle) => sum + candle.high - candle.low, 0) / 14
-        : 0;
-    if (!last || averageAtr <= 0) {
-      res.status(409).json({ error: "Live candle data unavailable; order blocked" });
-      return;
-    }
+
     const slDistance = Math.abs(entryPrice - input.sl);
     if (slDistance < averageAtr * 0.8 || slDistance > averageAtr * 2.5) {
       res.status(409).json({ error: "SL distance must be between 0.8 ATR and 2.5 ATR" });
       return;
     }
+
     const tpDistance = Math.abs(input.tp - entryPrice);
     const rewardRisk = tpDistance / slDistance;
     if (rewardRisk < 2 || rewardRisk > 3) {
       res.status(409).json({ error: "TP must target a 1:2 to 1:3 risk-to-reward ratio" });
       return;
     }
-    const spread = price.ask - price.bid;
-    const maxSpread = Math.max(specification.tickSize, averageAtr * 0.1) *
-      Number(risk.spread_multiplier ?? 2.5);
-    if (spread > maxSpread) {
-      res.status(409).json({ error: "Current broker spread exceeds the configured protection threshold" });
-      return;
-    }
-    const riskPercent = Number(risk.risk_per_trade ?? 1) / 100;
+
+    const effectiveRiskPercent = (riskSettings.riskPerTrade / 100) * riskCheck.riskMultiplier;
     const lossPerLot = (slDistance / specification.tickSize) * specification.tickValue;
-    const requestedLot = (live.equity * riskPercent) / lossPerLot;
+    const requestedLot = (live.equity * effectiveRiskPercent) / lossPerLot;
     const volumeStep = specification.volumeStep;
     const floorLot = (value: number) =>
       Math.floor(value / volumeStep) * volumeStep;
     const lot = floorLot(Math.min(input.lot, requestedLot, specification.volumeMax));
+
     if (lot < specification.volumeMin) {
       res.status(409).json({ error: "Broker minimum volume would exceed the configured risk" });
       return;
     }
+
     const marginUsed = (lot * specification.contractSize * entryPrice) / live.leverage;
     if (
       (live.freeMargin !== null && marginUsed > live.freeMargin) ||
@@ -397,51 +350,30 @@ router.post("/engine/execute", async (req, res) => {
       res.status(409).json({ error: "Broker free-margin protection blocked this order" });
       return;
     }
-    const result = await executeMetaApiTrade({
+
+    // Route order through runPostExecutionPipeline
+    const pipelineResult = await runPostExecutionPipeline({
       accountId: input.accountId,
-      actionType: input.direction === "BUY" ? "ORDER_TYPE_BUY" : "ORDER_TYPE_SELL",
-      symbol: realSymbol,
-      volume: lot,
-      stopLoss: input.sl,
-      takeProfit: input.tp,
+      symbol: input.symbol,
+      realSymbol,
+      direction: input.direction,
+      lot,
+      sl: input.sl,
+      tp: input.tp,
+      poiType: input.poiType ?? undefined,
+      bosMssTag: input.bosMssTag ?? undefined,
+      leverage: live.leverage,
+      marginUsed,
     });
-    const orderId =
-      typeof result.orderId === "string"
-        ? result.orderId
-        : typeof result.positionId === "string"
-          ? result.positionId
-          : null;
-    const brokerPositionId =
-      typeof result.positionId === "string" ? result.positionId : null;
-    await supabaseRequest("journal", {
-      method: "POST",
-      prefer: "return=representation",
-      body: {
-        account_id: input.accountId,
-        symbol: input.symbol,
-        real_symbol: realSymbol,
-        direction: input.direction,
-        entry: entryPrice,
-        sl: input.sl,
-        initial_sl: input.sl,
-        tp: input.tp,
-        lot,
-        pnl: 0,
-        r_multiple: 0,
-        status: "OPEN",
-        broker_position_id: brokerPositionId,
-        broker_order_id: typeof result.orderId === "string" ? result.orderId : null,
-        broker_status: "OPEN",
-        poi_type: input.poiType ?? null,
-        bos_mss_tag: input.bosMssTag ?? null,
-        htf_bias: null,
-        leverage: live.leverage,
-        margin_used: marginUsed,
-      },
-    });
+
+    if (!pipelineResult.success) {
+      res.status(502).json({ error: pipelineResult.error ?? "Order execution pipeline failed" });
+      return;
+    }
+
     res.json({
-      orderId,
-      positionId: brokerPositionId,
+      orderId: pipelineResult.orderId,
+      positionId: pipelineResult.positionId,
       accountId: input.accountId,
       symbol: input.symbol,
       direction: input.direction,
@@ -451,7 +383,10 @@ router.post("/engine/execute", async (req, res) => {
       tp: input.tp,
       leverage: live.leverage,
       marginUsed,
+      slVerified: pipelineResult.slVerified,
+      tpVerified: pipelineResult.tpVerified,
       status: "OPEN",
+      logs: pipelineResult.logs,
     });
   } catch (error) {
     const message = errorMessage(error);

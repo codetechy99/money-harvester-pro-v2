@@ -7,7 +7,7 @@ type SupabaseOptions = {
   prefer?: string;
 };
 
-function getConfig() {
+export function getConfig() {
   const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
   const key = process.env.SUPABASE_SERVICE_KEY;
   if (!url || !key) {

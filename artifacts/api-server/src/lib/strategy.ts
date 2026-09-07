@@ -1,5 +1,7 @@
 import { getHistoricalCandles, type Candle } from "./metaapi";
 
+export type { Candle };
+
 export const SUPPORTED_SYMBOLS = [
   "EURUSD",
   "GBPUSD",
@@ -8,23 +10,39 @@ export const SUPPORTED_SYMBOLS = [
   "US30",
 ] as const;
 
-type Swing = { index: number; price: number; type: "HIGH" | "LOW" };
-type Pool = {
+export type Swing = { index: number; price: number; type: "HIGH" | "LOW" };
+
+export type Pool = {
   type: "BSL" | "SSL";
   avgPrice: number;
   strength: number;
   swept: boolean;
 };
-type Poi = {
+
+export type Poi = {
   high: number;
   low: number;
   creationIndex: number;
   expiryIndex: number;
   touched: boolean;
-  type: "OB_BULL" | "OB_BEAR" | "FVG";
+  type: "OB_BULL" | "OB_BEAR" | "FVG_BULL" | "FVG_BEAR";
+  creationTime?: string;
 };
 
-function atr(candles: Candle[], period = 14) {
+export type SetupScoreResult = {
+  score: number;
+  breakdown: {
+    htfAlignment: number;
+    liquiditySweep: number;
+    poiQuality: number;
+    bosMss: number;
+    m5Confirmation: number;
+  };
+  action: "STRONG_BUY" | "BUY" | "STRONG_SELL" | "SELL" | "REJECT";
+  direction: "BUY" | "SELL" | null;
+};
+
+export function atr(candles: Candle[], period = 14) {
   if (candles.length < period + 1) return 0;
   const ranges = candles.slice(1).map((candle, index) => {
     const previousClose = candles[index].close;
@@ -38,7 +56,7 @@ function atr(candles: Candle[], period = 14) {
   return recent.reduce((sum, value) => sum + value, 0) / recent.length;
 }
 
-function detectSwings(candles: Candle[], radius: number): Swing[] {
+export function detectSwings(candles: Candle[], radius: number): Swing[] {
   const result: Swing[] = [];
   for (let index = radius; index < candles.length - radius; index += 1) {
     const candle = candles[index];
@@ -60,7 +78,7 @@ function detectSwings(candles: Candle[], radius: number): Swing[] {
   return result;
 }
 
-function findPools(candles: Candle[], swings: Swing[], averageAtr: number) {
+export function findPools(candles: Candle[], swings: Swing[], averageAtr: number): Pool[] {
   const pools: Pool[] = [];
   const threshold = averageAtr * 0.15;
   const highs = swings.filter((swing) => swing.type === "HIGH");
@@ -100,78 +118,368 @@ function findPools(candles: Candle[], swings: Swing[], averageAtr: number) {
   return pools;
 }
 
-function calculateTrend(swings: Swing[]) {
+export function evaluateLiquiditySweeps(candles: Candle[], pools: Pool[]): { pools: Pool[]; activeSweep: Pool | null } {
+  if (!candles.length) return { pools, activeSweep: null };
+  const closedCandles = candles.slice(0, -1);
+  const averageAtr = atr(closedCandles.length ? closedCandles : candles);
+
+  let activeSweep: Pool | null = null;
+  const updatedPools = pools.map((pool) => {
+    let isSwept = pool.swept;
+    for (const candle of closedCandles) {
+      const sweptThisCandle =
+        pool.type === "BSL"
+          ? candle.high >= pool.avgPrice + averageAtr * 0.15 && candle.close < pool.avgPrice
+          : candle.low <= pool.avgPrice - averageAtr * 0.15 && candle.close > pool.avgPrice;
+      if (sweptThisCandle) {
+        isSwept = true;
+        if (candle === closedCandles[closedCandles.length - 1]) {
+          activeSweep = { ...pool, swept: true };
+        }
+      }
+    }
+    return { ...pool, swept: isSwept };
+  });
+
+  return { pools: updatedPools, activeSweep };
+}
+
+export function detectBosMss(candles: Candle[], internalSwings: Swing[]) {
+  const closed = candles.slice(0, -1);
+  if (closed.length < 2) {
+    return { detected: false, type: null, tag: null };
+  }
+  const lastClosed = closed[closed.length - 1];
+  const prevClosed = closed[closed.length - 2];
+
+  const recentHighSwings = internalSwings.filter((s) => s.type === "HIGH" && s.index < closed.length - 1);
+  const recentLowSwings = internalSwings.filter((s) => s.type === "LOW" && s.index < closed.length - 1);
+
+  const lastHigh = recentHighSwings.at(-1);
+  const lastLow = recentLowSwings.at(-1);
+
+  if (lastHigh && lastClosed.close > lastHigh.price && prevClosed.close <= lastHigh.price) {
+    return { detected: true, type: "BULLISH_BOS", tag: "BOS_BULL" };
+  }
+  if (lastLow && lastClosed.close < lastLow.price && prevClosed.close >= lastLow.price) {
+    return { detected: true, type: "BEARISH_BOS", tag: "BOS_BEAR" };
+  }
+
+  return { detected: false, type: null, tag: null };
+}
+
+export function calculateTrend(swings: Swing[]) {
   const highs = swings.filter((swing) => swing.type === "HIGH").slice(-2);
   const lows = swings.filter((swing) => swing.type === "LOW").slice(-2);
   if (highs.length < 2 || lows.length < 2) return null;
-  if (
-    highs[1].price > highs[0].price &&
-    lows[1].price > lows[0].price
-  ) {
+  if (highs[1].price > highs[0].price && lows[1].price > lows[0].price) {
     return "BULLISH";
   }
-  if (
-    highs[1].price < highs[0].price &&
-    lows[1].price < lows[0].price
-  ) {
+  if (highs[1].price < highs[0].price && lows[1].price < lows[0].price) {
     return "BEARISH";
   }
   return "RANGING";
 }
 
-function inferPoi(
+export function detectPoi(
   candles: Candle[],
   internalSwings: Swing[],
-  pools: Pool[],
   averageAtr: number,
-) {
-  const recent = candles.slice(-3);
+): Poi | null {
+  const closed = candles.slice(0, -1);
+  const recent = closed.slice(-5);
+
   for (let offset = recent.length - 1; offset >= 0; offset -= 1) {
-    const candleIndex = candles.length - recent.length + offset;
+    const candleIndex = closed.length - recent.length + offset;
     const candle = recent[offset];
     const body = Math.abs(candle.close - candle.open);
-    const sameColorBefore = candles
-      .slice(Math.max(0, candleIndex - 2), candleIndex)
-      .filter((item) => Math.sign(item.close - item.open) === Math.sign(candle.close - candle.open))
-      .length;
+
     const breaksOpposite = internalSwings.some(
       (swing) =>
         swing.index < candleIndex &&
         ((candle.close > swing.price && swing.type === "HIGH") ||
           (candle.close < swing.price && swing.type === "LOW")),
     );
-    const activeSweep = pools.find((pool) => {
-      const wick =
-        pool.type === "BSL"
-          ? candle.high >= pool.avgPrice + averageAtr * 0.2
-          : candle.low <= pool.avgPrice - averageAtr * 0.2;
-      const closeBack =
-        pool.type === "BSL"
-          ? candle.close < pool.avgPrice
-          : candle.close > pool.avgPrice;
-      const candleBody = Math.abs(candle.close - candle.open);
-      const wickLength =
-        pool.type === "BSL"
-          ? candle.high - Math.max(candle.open, candle.close)
-          : Math.min(candle.open, candle.close) - candle.low;
-      return wick && closeBack && wickLength > candleBody;
-    });
-    if (body > averageAtr * 1.5 && sameColorBefore >= 2 && breaksOpposite) {
-      const bullish = candle.close > candle.open;
+
+    if (body > averageAtr * 1.2 && breaksOpposite) {
+      const isBull = candle.close > candle.open;
+
+      // Check for FVG in 3-candle sequence
+      if (candleIndex >= 2 && candleIndex < closed.length) {
+        const prevCandle = closed[candleIndex - 1];
+        const nextCandle = closed[candleIndex + 1];
+        if (nextCandle) {
+          if (isBull && nextCandle.low > prevCandle.high) {
+            return {
+              high: nextCandle.low,
+              low: prevCandle.high,
+              creationIndex: candleIndex,
+              expiryIndex: candleIndex + 50,
+              touched: false,
+              type: "FVG_BULL",
+              creationTime: candle.time,
+            };
+          }
+          if (!isBull && nextCandle.high < prevCandle.low) {
+            return {
+              high: prevCandle.low,
+              low: nextCandle.high,
+              creationIndex: candleIndex,
+              expiryIndex: candleIndex + 50,
+              touched: false,
+              type: "FVG_BEAR",
+              creationTime: candle.time,
+            };
+          }
+        }
+      }
+
       return {
-        poi: {
-          high: candle.high,
-          low: candle.low,
-          creationIndex: candleIndex,
-          expiryIndex: candleIndex + 50,
-          touched: false,
-          type: bullish ? "OB_BULL" : "OB_BEAR",
-        } satisfies Poi,
-        swept: Boolean(activeSweep),
+        high: candle.high,
+        low: candle.low,
+        creationIndex: candleIndex,
+        expiryIndex: candleIndex + 50,
+        touched: false,
+        type: isBull ? "OB_BULL" : "OB_BEAR",
+        creationTime: candle.time,
       };
     }
   }
-  return { poi: null, swept: false };
+
+  return null;
+}
+
+export function evaluateM5Confirmation(
+  m5Candles: Candle[],
+  m15LastTime: string,
+  poi: Poi | null,
+) {
+  if (!m5Candles.length) {
+    return {
+      evaluated: false,
+      m5Confirmed: false,
+      poiTouched: false,
+      reason: "No M5 candles returned by MetaApi",
+      diagnostics: "M5 confirmation skipped: missing M5 data",
+    };
+  }
+
+  const closedM5 = m5Candles.slice(0, -1);
+  if (!closedM5.length) {
+    return {
+      evaluated: false,
+      m5Confirmed: false,
+      poiTouched: false,
+      reason: "Insufficient closed M5 candles",
+      diagnostics: "M5 confirmation skipped: waiting for closed M5 candle",
+    };
+  }
+
+  if (!poi) {
+    return {
+      evaluated: true,
+      m5Confirmed: false,
+      poiTouched: false,
+      reason: "No active POI detected",
+      diagnostics: "M5 confirmation evaluated: no POI present",
+    };
+  }
+
+  const poiTouched = closedM5.some((candle) => {
+    const afterPoiTime = poi.creationTime ? candle.time >= poi.creationTime : candle.time >= m15LastTime;
+    return afterPoiTime && candle.high >= poi.low && candle.low <= poi.high;
+  });
+
+  if (!poiTouched) {
+    return {
+      evaluated: true,
+      m5Confirmed: false,
+      poiTouched: false,
+      reason: "M15 POI not touched on M5",
+      diagnostics: `M5 confirmation evaluated: POI [${poi.type} ${poi.low}-${poi.high}] untouched`,
+    };
+  }
+
+  // Micro structure confirmation on M5 after POI touch
+  const isBullPoi = poi.type === "OB_BULL" || poi.type === "FVG_BULL";
+  const m5Swings = detectSwings(closedM5, 3);
+  const lastM5Swings = m5Swings.slice(-2);
+
+  let microConfirmed = false;
+  if (lastM5Swings.length >= 2) {
+    if (isBullPoi) {
+      const highSwings = lastM5Swings.filter((s) => s.type === "HIGH");
+      if (highSwings.length >= 2 && highSwings[1].price > highSwings[0].price) {
+        microConfirmed = true;
+      }
+    } else {
+      const lowSwings = lastM5Swings.filter((s) => s.type === "LOW");
+      if (lowSwings.length >= 2 && lowSwings[1].price < lowSwings[0].price) {
+        microConfirmed = true;
+      }
+    }
+  }
+
+  // Fallback micro displacement candle check on M5 if swing detection is early
+  if (!microConfirmed && closedM5.length >= 2) {
+    const recentM5 = closedM5.slice(-3);
+    const avgM5Atr = atr(closedM5, 10);
+    const microDisplacement = recentM5.some((c) => {
+      const body = Math.abs(c.close - c.open);
+      return isBullPoi ? c.close > c.open && body > avgM5Atr * 1.1 : c.close < c.open && body > avgM5Atr * 1.1;
+    });
+    if (microDisplacement) {
+      microConfirmed = true;
+    }
+  }
+
+  return {
+    evaluated: true,
+    m5Confirmed: microConfirmed,
+    poiTouched: true,
+    reason: microConfirmed ? "M5 micro-structure displacement confirmed" : "M5 POI touched, waiting micro confirmation",
+    diagnostics: microConfirmed
+      ? "M5 confirmation evaluated: micro MSS/displacement confirmed"
+      : "M5 confirmation evaluated: POI touched, awaiting micro displacement",
+  };
+}
+
+export function evaluateM1Trigger(
+  m1Candles: Candle[],
+  m15LastTime: string,
+  poi: Poi | null,
+  m5Confirmed: boolean,
+) {
+  if (!m1Candles || !m1Candles.length) {
+    // If M1 data is not provided or unavailable, fallback to M5 confirmation alignment so execution is not blocked due to missing M1 data unless M1 is supplied
+    return {
+      evaluated: false,
+      m1Triggered: m5Confirmed,
+      reason: "M1 data unavailable; fallback to M5 confirmation",
+      diagnostics: "M1 trigger evaluated: fallback to M5 confirmation",
+    };
+  }
+
+  if (!m5Confirmed) {
+    return {
+      evaluated: true,
+      m1Triggered: false,
+      reason: "M1 entry blocked: M5 confirmation required first",
+      diagnostics: "M1 trigger blocked: M5 micro confirmation absent",
+    };
+  }
+
+  const closedM1 = m1Candles.slice(0, -1);
+  if (!closedM1.length) {
+    return {
+      evaluated: true,
+      m1Triggered: false,
+      reason: "Insufficient closed M1 candles",
+      diagnostics: "M1 trigger skipped: waiting for closed M1 candle",
+    };
+  }
+
+  if (!poi) {
+    return {
+      evaluated: true,
+      m1Triggered: false,
+      reason: "No POI present",
+      diagnostics: "M1 trigger blocked: missing POI",
+    };
+  }
+
+  const isBull = poi.type === "OB_BULL" || poi.type === "FVG_BULL";
+  const recentM1 = closedM1.slice(-5);
+  const avgM1Atr = atr(closedM1, 10);
+
+  const hasM1Displacement = recentM1.some((c) => {
+    const body = Math.abs(c.close - c.open);
+    return isBull ? c.close > c.open && body >= avgM1Atr * 1.0 : c.close < c.open && body >= avgM1Atr * 1.0;
+  });
+
+  return {
+    evaluated: true,
+    m1Triggered: hasM1Displacement,
+    reason: hasM1Displacement ? "M1 micro-displacement entry trigger confirmed" : "M1 micro-displacement entry trigger absent",
+    diagnostics: hasM1Displacement
+      ? "M1 entry trigger confirmed on closed candle"
+      : "M1 entry trigger pending micro-displacement candle",
+  };
+}
+
+export function calculateSetupScore(input: {
+  htfBias: string | null;
+  htfConflict: boolean;
+  liquiditySwept?: boolean;
+  sweep?: Pool | null;
+  poiPresent?: boolean;
+  displacement?: { poi: Poi | null; swept: boolean };
+  bosMssPresent?: boolean;
+  trend?: string | null;
+  m5Confirmed: boolean;
+  m1Triggered?: boolean;
+}): SetupScoreResult {
+  const htfAlignment = input.htfConflict
+    ? 0
+    : input.htfBias
+      ? 25
+      : 0;
+
+  const sweepDone = Boolean(input.liquiditySwept ?? input.sweep);
+  const liquiditySweep = sweepDone ? 25 : 0;
+
+  const poiPresent = Boolean(input.poiPresent ?? input.displacement?.poi);
+  const poiQuality = poiPresent ? 20 : 0;
+
+  const bosMssPresent = Boolean(input.bosMssPresent);
+  const bosMss = bosMssPresent ? 15 : 0;
+
+  const m5Confirmation = input.m5Confirmed ? 15 : 0;
+  const m1Triggered = input.m1Triggered ?? true; // Defaults to true if not explicitly supplied
+
+  const score = htfAlignment + liquiditySweep + poiQuality + bosMss + m5Confirmation;
+
+  const poiType = input.displacement?.poi?.type;
+  let isBullish = poiType === "OB_BULL" || poiType === "FVG_BULL" || input.htfBias?.includes("BULLISH") || input.trend === "BULLISH";
+  if (poiType === "OB_BEAR" || poiType === "FVG_BEAR" || input.htfBias?.includes("BEARISH") || input.trend === "BEARISH") {
+    isBullish = false;
+  }
+
+  // Mandatory core conditions: ALL must be met to trigger execution action
+  const hasMandatoryConditions =
+    !input.htfConflict &&
+    Boolean(input.htfBias) &&
+    sweepDone &&
+    bosMssPresent &&
+    poiPresent &&
+    input.m5Confirmed &&
+    m1Triggered;
+
+  let action: SetupScoreResult["action"] = "REJECT";
+  let direction: "BUY" | "SELL" | null = null;
+
+  if (hasMandatoryConditions) {
+    if (score >= 80) {
+      action = isBullish ? "STRONG_BUY" : "STRONG_SELL";
+      direction = isBullish ? "BUY" : "SELL";
+    } else if (score >= 60) {
+      action = isBullish ? "BUY" : "SELL";
+      direction = isBullish ? "BUY" : "SELL";
+    }
+  }
+
+  return {
+    score,
+    breakdown: {
+      htfAlignment,
+      liquiditySweep,
+      poiQuality,
+      bosMss,
+      m5Confirmation,
+    },
+    action,
+    direction,
+  };
 }
 
 export async function analyzeSymbol(accountId: string, baseSymbol: string) {
@@ -194,14 +502,16 @@ export async function analyzeSymbol(accountId: string, baseSymbol: string) {
         break;
       }
     } catch {
-      // A missing symbol is expected during suffix discovery; try the next one.
+      // Missing symbol expected during suffix discovery
     }
   }
-  const [h4, daily, m5] = await Promise.all([
+  const [h4, daily, m5, m1] = await Promise.all([
     getHistoricalCandles(accountId, realSymbol, "4h", 120),
     getHistoricalCandles(accountId, realSymbol, "1d", 60),
     getHistoricalCandles(accountId, realSymbol, "5m", 80),
+    getHistoricalCandles(accountId, realSymbol, "1m", 120).catch(() => []),
   ]);
+
   if (m15.length < 40) {
     return {
       realSymbol,
@@ -212,80 +522,145 @@ export async function analyzeSymbol(accountId: string, baseSymbol: string) {
       poiType: null,
       poiHigh: null,
       poiLow: null,
+      setupScore: 0,
+      scoreAction: "REJECT",
+      direction: null,
+      suggestedEntry: null,
+      suggestedSl: null,
+      suggestedTp: null,
+      candleTimestamp: new Date().toISOString(),
       diagnostics: ["SCANNING — not enough live M15 candles returned by MetaApi"],
       lastUpdated: new Date().toISOString(),
       liquidityPool: [],
       poi: null,
+      bosMssTag: null,
     };
   }
 
-  const averageAtr = atr(m15);
-  const externalSwings = detectSwings(m15, 10);
-  const internalSwings = detectSwings(m15, 5);
+  const closedM15 = m15.slice(0, -1);
+  const formingCandle = m15[m15.length - 1];
+
+  const averageAtr = atr(closedM15);
+  const externalSwings = detectSwings(closedM15, 10);
+  const internalSwings = detectSwings(closedM15, 5);
   const trend = calculateTrend(externalSwings);
-  const pools = findPools(m15, externalSwings, averageAtr);
-  const sweep = pools.find((pool) => {
-    const candle = m15[m15.length - 1];
-    return pool.type === "BSL"
-      ? candle.high >= pool.avgPrice + averageAtr * 0.2 &&
-          candle.close < pool.avgPrice
-      : candle.low <= pool.avgPrice - averageAtr * 0.2 &&
-          candle.close > pool.avgPrice;
-  });
-  const displacement = inferPoi(m15, internalSwings, pools, averageAtr);
+
+  // 1. Independent Liquidity Pool & Sweep Evaluation
+  const rawPools = findPools(closedM15, externalSwings, averageAtr);
+  const { pools, activeSweep } = evaluateLiquiditySweeps(closedM15, rawPools);
+
+  // 2. Independent BOS / MSS Detection
+  const bosMssResult = detectBosMss(closedM15, internalSwings);
+
+  // 3. POI / FVG Detection
+  const poi = detectPoi(closedM15, internalSwings, averageAtr);
+
+  // 4. HTF Trend & Alignment
   const dailyTrend = calculateTrend(detectSwings(daily, 3));
   const h4Trend = calculateTrend(detectSwings(h4, 5));
-  const current = m15[m15.length - 1];
+  const currentClose = formingCandle.close;
   const dailyHigh = Math.max(...daily.slice(-50).map((candle) => candle.high));
   const dailyLow = Math.min(...daily.slice(-50).map((candle) => candle.low));
   const equilibrium = (dailyHigh + dailyLow) / 2;
+
   const htfBias =
-    dailyTrend === "BULLISH" && current.close <= equilibrium
+    dailyTrend === "BULLISH" && currentClose <= equilibrium
       ? "BULLISH_DISCOUNT"
-      : dailyTrend === "BEARISH" && current.close >= equilibrium
+      : dailyTrend === "BEARISH" && currentClose >= equilibrium
         ? "BEARISH_PREMIUM"
         : dailyTrend ?? null;
+
   const htfConflict =
     (dailyTrend === "BULLISH" && h4Trend === "BEARISH") ||
     (dailyTrend === "BEARISH" && h4Trend === "BULLISH");
-  const poi = displacement.poi;
-  const poiTouched =
-    poi &&
-    m5.some(
-      (candle) =>
-        candle.time > m15[m15.length - 1].time &&
-        candle.high >= poi.low &&
-        candle.low <= poi.high,
-    );
-  const state = poi
-    ? poiTouched
-      ? "LTF_CONFIRM_M5"
-      : displacement.swept
-        ? "DISPLACEMENT_CONFIRMED"
-        : "WAITING_POI_TOUCH"
-    : sweep
-      ? "SWEPT"
-      : pools.length
-        ? "LIQUIDITY_FOUND"
-        : "SCANNING";
+
+  // 5. M5 Confirmation Evaluation (Genuinely calculated from market data)
+  const lastM15Time = closedM15[closedM15.length - 1].time;
+  const m5Eval = evaluateM5Confirmation(m5, lastM15Time, poi);
+
+  if (poi) {
+    poi.touched = m5Eval.poiTouched;
+  }
+
+  // 6. M1 Entry Trigger Evaluation
+  const m1Eval = evaluateM1Trigger(m1, lastM15Time, poi, m5Eval.m5Confirmed);
+
+  // 7. Setup Score Calculation
+  const isLiquiditySwept = pools.some((p) => p.swept);
+  const setupScoreObj = calculateSetupScore({
+    htfBias,
+    htfConflict,
+    liquiditySwept: isLiquiditySwept,
+    poiPresent: Boolean(poi),
+    bosMssPresent: bosMssResult.detected,
+    m5Confirmed: m5Eval.m5Confirmed,
+    m1Triggered: m1Eval.m1Triggered,
+    displacement: poi ? { poi, swept: isLiquiditySwept } : undefined,
+    trend,
+  });
+
+  // 8. State Machine
+  let state = "SCANNING";
+  if (poi) {
+    if (m5Eval.m5Confirmed && m1Eval.m1Triggered) {
+      state = "LTF_CONFIRM_M5";
+    } else if (m5Eval.poiTouched) {
+      state = "WAITING_POI_TOUCH";
+    } else {
+      state = "DISPLACEMENT_CONFIRMED";
+    }
+  } else if (activeSweep) {
+    state = "SWEPT";
+  } else if (pools.length) {
+    state = "LIQUIDITY_FOUND";
+  }
+
+  let direction: "BUY" | "SELL" | null = setupScoreObj.direction;
+  let suggestedEntry: number | null = null;
+  let suggestedSl: number | null = null;
+  let suggestedTp: number | null = null;
+
+  if (poi && direction) {
+    const isBull = direction === "BUY";
+    suggestedEntry = currentClose;
+    if (isBull) {
+      suggestedSl = poi.low - averageAtr * 0.2;
+      const slDistance = Math.abs(suggestedEntry - suggestedSl);
+      suggestedTp = suggestedEntry + slDistance * 2.5;
+    } else {
+      suggestedSl = poi.high + averageAtr * 0.2;
+      const slDistance = Math.abs(suggestedEntry - suggestedSl);
+      suggestedTp = suggestedEntry - slDistance * 2.5;
+    }
+  }
+
+  const activeSweepPool: Pool | null = activeSweep;
   const diagnostics = [
     `M15 trend ${trend ?? "UNKNOWN"}; daily ${dailyTrend ?? "UNKNOWN"}; H4 ${h4Trend ?? "UNKNOWN"}`,
     pools.length
-      ? `${pools.length} liquidity pool${pools.length === 1 ? "" : "s"} detected`
-      : "No equal-high/equal-low pool within 0.15 ATR14",
-    sweep ? `${sweep.type} sweep detected in latest M15 candle` : "Waiting for a valid liquidity sweep",
+      ? `${pools.length} liquidity pool${pools.length === 1 ? "" : "s"} detected (${pools.filter((p) => p.swept).length} swept)`
+      : "No equal-high/equal-low pool within threshold",
+    activeSweepPool
+      ? `${activeSweepPool.type} sweep confirmed on closed candle`
+      : isLiquiditySwept
+        ? "Historical liquidity sweep present on active pool"
+        : "Waiting for a valid liquidity sweep",
+    bosMssResult.detected
+      ? `Structure break detected: ${bosMssResult.type}`
+      : "No structural break (BOS/MSS) confirmed on closed candle",
     poi
-      ? `${poi.type} created at M15 index ${poi.creationIndex}; expires after 50 bars`
-      : "Waiting for displacement body > 1.5 ATR and internal break",
+      ? `${poi.type} created at M15 index ${poi.creationIndex}`
+      : "Waiting for displacement body > 1.2 ATR and internal break",
     htfConflict
       ? "HTF conflict — risk must be reduced to 50%"
       : htfBias
         ? `HTF location ${htfBias}`
         : "HTF premium/discount not aligned",
-    state === "LTF_CONFIRM_M5"
-      ? "M15 POI touched; waiting for M5 micro MSS confirmation"
-      : "No executable confirmation yet",
+    m5Eval.diagnostics,
+    m1Eval.diagnostics,
+    `Setup Score: ${setupScoreObj.score}/100 (${setupScoreObj.action})`,
   ];
+
   return {
     realSymbol,
     currentState: state,
@@ -295,9 +670,17 @@ export async function analyzeSymbol(accountId: string, baseSymbol: string) {
     poiType: poi?.type ?? null,
     poiHigh: poi?.high ?? null,
     poiLow: poi?.low ?? null,
+    setupScore: setupScoreObj.score,
+    scoreAction: setupScoreObj.action,
+    direction,
+    suggestedEntry,
+    suggestedSl,
+    suggestedTp,
+    candleTimestamp: formingCandle.time,
     diagnostics,
     lastUpdated: new Date().toISOString(),
     liquidityPool: pools,
     poi,
+    bosMssTag: bosMssResult.tag,
   };
 }

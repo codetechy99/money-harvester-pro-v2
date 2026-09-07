@@ -22201,7 +22201,7 @@ var require_request = __commonJS({
     defineGetter(req, "path", function path() {
       return parse(this).pathname;
     });
-    defineGetter(req, "host", function host() {
+    defineGetter(req, "host", function host2() {
       var trust = this.app.get("trust proxy fn");
       var val = this.get("X-Forwarded-Host");
       if (!val || !trust(this.socket.remoteAddress, 0)) {
@@ -22212,11 +22212,11 @@ var require_request = __commonJS({
       return val || void 0;
     });
     defineGetter(req, "hostname", function hostname() {
-      var host = this.host;
-      if (!host) return;
-      var offset = host[0] === "[" ? host.indexOf("]") + 1 : 0;
-      var index = host.indexOf(":", offset);
-      return index !== -1 ? host.substring(0, index) : host;
+      var host2 = this.host;
+      if (!host2) return;
+      var offset = host2[0] === "[" ? host2.indexOf("]") + 1 : 0;
+      var index = host2.indexOf(":", offset);
+      return index !== -1 ? host2.substring(0, index) : host2;
     });
     defineGetter(req, "fresh", function() {
       var method = this.method;
@@ -28198,7 +28198,7 @@ var require_pino = __commonJS({
     function pinoBundlerAbsolutePath(p) {
       try {
         const path = __require("path");
-        const outputDir = "/home/runner/workspace/artifacts/api-server/dist";
+        const outputDir = "/app/artifacts/api-server/dist";
         return path.resolve(outputDir, p.replace(/^\.\//, ""));
       } catch (e) {
         const f = new Function("p", "return new URL(p, import.meta.url).pathname");
@@ -33274,6 +33274,22 @@ async function getMetaApiHistoryDeals(accountId, startTime = new Date(Date.now()
     time: typeof deal.time === "string" ? deal.time : typeof deal.executionTime === "string" ? deal.executionTime : typeof deal.time === "number" ? new Date(deal.time).toISOString() : typeof deal.executionTime === "number" ? new Date(deal.executionTime).toISOString() : null
   }));
 }
+async function modifyMetaApiPosition(input) {
+  return metaapiFetch(
+    CLIENT_API,
+    `/users/current/accounts/${encodeURIComponent(input.accountId)}/trade`,
+    {
+      method: "POST",
+      body: JSON.stringify({
+        actionType: "POSITION_MODIFY_ID",
+        positionId: input.positionId,
+        stopLoss: input.stopLoss,
+        takeProfit: input.takeProfit,
+        comment: "MH-V2 PROTECTION CORRECTION"
+      })
+    }
+  );
+}
 async function moveMetaApiPositionStopToBreakEven(input) {
   return metaapiFetch(
     CLIENT_API,
@@ -33292,7 +33308,7 @@ async function moveMetaApiPositionStopToBreakEven(input) {
 }
 async function closeAllMetaApiPositions(accountId, positions) {
   haltTrading(accountId);
-  const closable = positions.filter((position) => Boolean(position.id));
+  const closable = positions.filter((position) => typeof position.id === "string" && Boolean(position.id));
   const outcomes = await Promise.all(
     closable.map(async (position) => {
       try {
@@ -33321,7 +33337,7 @@ async function closeAllMetaApiPositions(accountId, positions) {
   let remaining = [];
   try {
     const verified = await getLiveAccountSnapshot(accountId);
-    remaining = verified.positions.map((position) => position.id).filter((id) => Boolean(id));
+    remaining = verified.positions.map((position) => position.id).filter((id) => typeof id === "string" && Boolean(id));
     if (!remaining.length) clearTradingHalt(accountId);
   } catch {
   }
@@ -33703,6 +33719,45 @@ function findPools(candles, swings, averageAtr2) {
   }
   return pools;
 }
+function evaluateLiquiditySweeps(candles, pools) {
+  if (!candles.length) return { pools, activeSweep: null };
+  const closedCandles = candles.slice(0, -1);
+  const averageAtr2 = atr(closedCandles.length ? closedCandles : candles);
+  let activeSweep = null;
+  const updatedPools = pools.map((pool) => {
+    let isSwept = pool.swept;
+    for (const candle of closedCandles) {
+      const sweptThisCandle = pool.type === "BSL" ? candle.high >= pool.avgPrice + averageAtr2 * 0.15 && candle.close < pool.avgPrice : candle.low <= pool.avgPrice - averageAtr2 * 0.15 && candle.close > pool.avgPrice;
+      if (sweptThisCandle) {
+        isSwept = true;
+        if (candle === closedCandles[closedCandles.length - 1]) {
+          activeSweep = { ...pool, swept: true };
+        }
+      }
+    }
+    return { ...pool, swept: isSwept };
+  });
+  return { pools: updatedPools, activeSweep };
+}
+function detectBosMss(candles, internalSwings) {
+  const closed = candles.slice(0, -1);
+  if (closed.length < 2) {
+    return { detected: false, type: null, tag: null };
+  }
+  const lastClosed = closed[closed.length - 1];
+  const prevClosed = closed[closed.length - 2];
+  const recentHighSwings = internalSwings.filter((s) => s.type === "HIGH" && s.index < closed.length - 1);
+  const recentLowSwings = internalSwings.filter((s) => s.type === "LOW" && s.index < closed.length - 1);
+  const lastHigh = recentHighSwings.at(-1);
+  const lastLow = recentLowSwings.at(-1);
+  if (lastHigh && lastClosed.close > lastHigh.price && prevClosed.close <= lastHigh.price) {
+    return { detected: true, type: "BULLISH_BOS", tag: "BOS_BULL" };
+  }
+  if (lastLow && lastClosed.close < lastLow.price && prevClosed.close >= lastLow.price) {
+    return { detected: true, type: "BEARISH_BOS", tag: "BOS_BEAR" };
+  }
+  return { detected: false, type: null, tag: null };
+}
 function calculateTrend(swings) {
   const highs = swings.filter((swing) => swing.type === "HIGH").slice(-2);
   const lows = swings.filter((swing) => swing.type === "LOW").slice(-2);
@@ -33715,39 +33770,225 @@ function calculateTrend(swings) {
   }
   return "RANGING";
 }
-function inferPoi(candles, internalSwings, pools, averageAtr2) {
-  const recent = candles.slice(-3);
+function detectPoi(candles, internalSwings, averageAtr2) {
+  const closed = candles.slice(0, -1);
+  const recent = closed.slice(-5);
   for (let offset = recent.length - 1; offset >= 0; offset -= 1) {
-    const candleIndex = candles.length - recent.length + offset;
+    const candleIndex = closed.length - recent.length + offset;
     const candle = recent[offset];
     const body = Math.abs(candle.close - candle.open);
-    const sameColorBefore = candles.slice(Math.max(0, candleIndex - 2), candleIndex).filter((item) => Math.sign(item.close - item.open) === Math.sign(candle.close - candle.open)).length;
     const breaksOpposite = internalSwings.some(
       (swing) => swing.index < candleIndex && (candle.close > swing.price && swing.type === "HIGH" || candle.close < swing.price && swing.type === "LOW")
     );
-    const activeSweep = pools.find((pool) => {
-      const wick = pool.type === "BSL" ? candle.high >= pool.avgPrice + averageAtr2 * 0.2 : candle.low <= pool.avgPrice - averageAtr2 * 0.2;
-      const closeBack = pool.type === "BSL" ? candle.close < pool.avgPrice : candle.close > pool.avgPrice;
-      const candleBody = Math.abs(candle.close - candle.open);
-      const wickLength = pool.type === "BSL" ? candle.high - Math.max(candle.open, candle.close) : Math.min(candle.open, candle.close) - candle.low;
-      return wick && closeBack && wickLength > candleBody;
-    });
-    if (body > averageAtr2 * 1.5 && sameColorBefore >= 2 && breaksOpposite) {
-      const bullish = candle.close > candle.open;
+    if (body > averageAtr2 * 1.2 && breaksOpposite) {
+      const isBull = candle.close > candle.open;
+      if (candleIndex >= 2 && candleIndex < closed.length) {
+        const prevCandle = closed[candleIndex - 1];
+        const nextCandle = closed[candleIndex + 1];
+        if (nextCandle) {
+          if (isBull && nextCandle.low > prevCandle.high) {
+            return {
+              high: nextCandle.low,
+              low: prevCandle.high,
+              creationIndex: candleIndex,
+              expiryIndex: candleIndex + 50,
+              touched: false,
+              type: "FVG_BULL",
+              creationTime: candle.time
+            };
+          }
+          if (!isBull && nextCandle.high < prevCandle.low) {
+            return {
+              high: prevCandle.low,
+              low: nextCandle.high,
+              creationIndex: candleIndex,
+              expiryIndex: candleIndex + 50,
+              touched: false,
+              type: "FVG_BEAR",
+              creationTime: candle.time
+            };
+          }
+        }
+      }
       return {
-        poi: {
-          high: candle.high,
-          low: candle.low,
-          creationIndex: candleIndex,
-          expiryIndex: candleIndex + 50,
-          touched: false,
-          type: bullish ? "OB_BULL" : "OB_BEAR"
-        },
-        swept: Boolean(activeSweep)
+        high: candle.high,
+        low: candle.low,
+        creationIndex: candleIndex,
+        expiryIndex: candleIndex + 50,
+        touched: false,
+        type: isBull ? "OB_BULL" : "OB_BEAR",
+        creationTime: candle.time
       };
     }
   }
-  return { poi: null, swept: false };
+  return null;
+}
+function evaluateM5Confirmation(m5Candles, m15LastTime, poi) {
+  if (!m5Candles.length) {
+    return {
+      evaluated: false,
+      m5Confirmed: false,
+      poiTouched: false,
+      reason: "No M5 candles returned by MetaApi",
+      diagnostics: "M5 confirmation skipped: missing M5 data"
+    };
+  }
+  const closedM5 = m5Candles.slice(0, -1);
+  if (!closedM5.length) {
+    return {
+      evaluated: false,
+      m5Confirmed: false,
+      poiTouched: false,
+      reason: "Insufficient closed M5 candles",
+      diagnostics: "M5 confirmation skipped: waiting for closed M5 candle"
+    };
+  }
+  if (!poi) {
+    return {
+      evaluated: true,
+      m5Confirmed: false,
+      poiTouched: false,
+      reason: "No active POI detected",
+      diagnostics: "M5 confirmation evaluated: no POI present"
+    };
+  }
+  const poiTouched = closedM5.some((candle) => {
+    const afterPoiTime = poi.creationTime ? candle.time >= poi.creationTime : candle.time >= m15LastTime;
+    return afterPoiTime && candle.high >= poi.low && candle.low <= poi.high;
+  });
+  if (!poiTouched) {
+    return {
+      evaluated: true,
+      m5Confirmed: false,
+      poiTouched: false,
+      reason: "M15 POI not touched on M5",
+      diagnostics: `M5 confirmation evaluated: POI [${poi.type} ${poi.low}-${poi.high}] untouched`
+    };
+  }
+  const isBullPoi = poi.type === "OB_BULL" || poi.type === "FVG_BULL";
+  const m5Swings = detectSwings(closedM5, 3);
+  const lastM5Swings = m5Swings.slice(-2);
+  let microConfirmed = false;
+  if (lastM5Swings.length >= 2) {
+    if (isBullPoi) {
+      const highSwings = lastM5Swings.filter((s) => s.type === "HIGH");
+      if (highSwings.length >= 2 && highSwings[1].price > highSwings[0].price) {
+        microConfirmed = true;
+      }
+    } else {
+      const lowSwings = lastM5Swings.filter((s) => s.type === "LOW");
+      if (lowSwings.length >= 2 && lowSwings[1].price < lowSwings[0].price) {
+        microConfirmed = true;
+      }
+    }
+  }
+  if (!microConfirmed && closedM5.length >= 2) {
+    const recentM5 = closedM5.slice(-3);
+    const avgM5Atr = atr(closedM5, 10);
+    const microDisplacement = recentM5.some((c) => {
+      const body = Math.abs(c.close - c.open);
+      return isBullPoi ? c.close > c.open && body > avgM5Atr * 1.1 : c.close < c.open && body > avgM5Atr * 1.1;
+    });
+    if (microDisplacement) {
+      microConfirmed = true;
+    }
+  }
+  return {
+    evaluated: true,
+    m5Confirmed: microConfirmed,
+    poiTouched: true,
+    reason: microConfirmed ? "M5 micro-structure displacement confirmed" : "M5 POI touched, waiting micro confirmation",
+    diagnostics: microConfirmed ? "M5 confirmation evaluated: micro MSS/displacement confirmed" : "M5 confirmation evaluated: POI touched, awaiting micro displacement"
+  };
+}
+function evaluateM1Trigger(m1Candles, m15LastTime, poi, m5Confirmed) {
+  if (!m1Candles || !m1Candles.length) {
+    return {
+      evaluated: false,
+      m1Triggered: m5Confirmed,
+      reason: "M1 data unavailable; fallback to M5 confirmation",
+      diagnostics: "M1 trigger evaluated: fallback to M5 confirmation"
+    };
+  }
+  if (!m5Confirmed) {
+    return {
+      evaluated: true,
+      m1Triggered: false,
+      reason: "M1 entry blocked: M5 confirmation required first",
+      diagnostics: "M1 trigger blocked: M5 micro confirmation absent"
+    };
+  }
+  const closedM1 = m1Candles.slice(0, -1);
+  if (!closedM1.length) {
+    return {
+      evaluated: true,
+      m1Triggered: false,
+      reason: "Insufficient closed M1 candles",
+      diagnostics: "M1 trigger skipped: waiting for closed M1 candle"
+    };
+  }
+  if (!poi) {
+    return {
+      evaluated: true,
+      m1Triggered: false,
+      reason: "No POI present",
+      diagnostics: "M1 trigger blocked: missing POI"
+    };
+  }
+  const isBull = poi.type === "OB_BULL" || poi.type === "FVG_BULL";
+  const recentM1 = closedM1.slice(-5);
+  const avgM1Atr = atr(closedM1, 10);
+  const hasM1Displacement = recentM1.some((c) => {
+    const body = Math.abs(c.close - c.open);
+    return isBull ? c.close > c.open && body >= avgM1Atr * 1 : c.close < c.open && body >= avgM1Atr * 1;
+  });
+  return {
+    evaluated: true,
+    m1Triggered: hasM1Displacement,
+    reason: hasM1Displacement ? "M1 micro-displacement entry trigger confirmed" : "M1 micro-displacement entry trigger absent",
+    diagnostics: hasM1Displacement ? "M1 entry trigger confirmed on closed candle" : "M1 entry trigger pending micro-displacement candle"
+  };
+}
+function calculateSetupScore(input) {
+  const htfAlignment = input.htfConflict ? 0 : input.htfBias ? 25 : 0;
+  const sweepDone = Boolean(input.liquiditySwept ?? input.sweep);
+  const liquiditySweep = sweepDone ? 25 : 0;
+  const poiPresent = Boolean(input.poiPresent ?? input.displacement?.poi);
+  const poiQuality = poiPresent ? 20 : 0;
+  const bosMssPresent = Boolean(input.bosMssPresent);
+  const bosMss = bosMssPresent ? 15 : 0;
+  const m5Confirmation = input.m5Confirmed ? 15 : 0;
+  const m1Triggered = input.m1Triggered ?? true;
+  const score = htfAlignment + liquiditySweep + poiQuality + bosMss + m5Confirmation;
+  const poiType = input.displacement?.poi?.type;
+  let isBullish = poiType === "OB_BULL" || poiType === "FVG_BULL" || input.htfBias?.includes("BULLISH") || input.trend === "BULLISH";
+  if (poiType === "OB_BEAR" || poiType === "FVG_BEAR" || input.htfBias?.includes("BEARISH") || input.trend === "BEARISH") {
+    isBullish = false;
+  }
+  const hasMandatoryConditions = !input.htfConflict && Boolean(input.htfBias) && sweepDone && bosMssPresent && poiPresent && input.m5Confirmed && m1Triggered;
+  let action = "REJECT";
+  let direction = null;
+  if (hasMandatoryConditions) {
+    if (score >= 80) {
+      action = isBullish ? "STRONG_BUY" : "STRONG_SELL";
+      direction = isBullish ? "BUY" : "SELL";
+    } else if (score >= 60) {
+      action = isBullish ? "BUY" : "SELL";
+      direction = isBullish ? "BUY" : "SELL";
+    }
+  }
+  return {
+    score,
+    breakdown: {
+      htfAlignment,
+      liquiditySweep,
+      poiQuality,
+      bosMss,
+      m5Confirmation
+    },
+    action,
+    direction
+  };
 }
 async function analyzeSymbol(accountId, baseSymbol) {
   const candidates = [
@@ -33771,10 +34012,11 @@ async function analyzeSymbol(accountId, baseSymbol) {
     } catch {
     }
   }
-  const [h4, daily, m5] = await Promise.all([
+  const [h4, daily, m5, m1] = await Promise.all([
     getHistoricalCandles(accountId, realSymbol, "4h", 120),
     getHistoricalCandles(accountId, realSymbol, "1d", 60),
-    getHistoricalCandles(accountId, realSymbol, "5m", 80)
+    getHistoricalCandles(accountId, realSymbol, "5m", 80),
+    getHistoricalCandles(accountId, realSymbol, "1m", 120).catch(() => [])
   ]);
   if (m15.length < 40) {
     return {
@@ -33786,42 +34028,98 @@ async function analyzeSymbol(accountId, baseSymbol) {
       poiType: null,
       poiHigh: null,
       poiLow: null,
+      setupScore: 0,
+      scoreAction: "REJECT",
+      direction: null,
+      suggestedEntry: null,
+      suggestedSl: null,
+      suggestedTp: null,
+      candleTimestamp: (/* @__PURE__ */ new Date()).toISOString(),
       diagnostics: ["SCANNING \u2014 not enough live M15 candles returned by MetaApi"],
       lastUpdated: (/* @__PURE__ */ new Date()).toISOString(),
       liquidityPool: [],
-      poi: null
+      poi: null,
+      bosMssTag: null
     };
   }
-  const averageAtr2 = atr(m15);
-  const externalSwings = detectSwings(m15, 10);
-  const internalSwings = detectSwings(m15, 5);
+  const closedM15 = m15.slice(0, -1);
+  const formingCandle = m15[m15.length - 1];
+  const averageAtr2 = atr(closedM15);
+  const externalSwings = detectSwings(closedM15, 10);
+  const internalSwings = detectSwings(closedM15, 5);
   const trend = calculateTrend(externalSwings);
-  const pools = findPools(m15, externalSwings, averageAtr2);
-  const sweep = pools.find((pool) => {
-    const candle = m15[m15.length - 1];
-    return pool.type === "BSL" ? candle.high >= pool.avgPrice + averageAtr2 * 0.2 && candle.close < pool.avgPrice : candle.low <= pool.avgPrice - averageAtr2 * 0.2 && candle.close > pool.avgPrice;
-  });
-  const displacement = inferPoi(m15, internalSwings, pools, averageAtr2);
+  const rawPools = findPools(closedM15, externalSwings, averageAtr2);
+  const { pools, activeSweep } = evaluateLiquiditySweeps(closedM15, rawPools);
+  const bosMssResult = detectBosMss(closedM15, internalSwings);
+  const poi = detectPoi(closedM15, internalSwings, averageAtr2);
   const dailyTrend = calculateTrend(detectSwings(daily, 3));
   const h4Trend = calculateTrend(detectSwings(h4, 5));
-  const current = m15[m15.length - 1];
+  const currentClose = formingCandle.close;
   const dailyHigh = Math.max(...daily.slice(-50).map((candle) => candle.high));
   const dailyLow = Math.min(...daily.slice(-50).map((candle) => candle.low));
   const equilibrium = (dailyHigh + dailyLow) / 2;
-  const htfBias = dailyTrend === "BULLISH" && current.close <= equilibrium ? "BULLISH_DISCOUNT" : dailyTrend === "BEARISH" && current.close >= equilibrium ? "BEARISH_PREMIUM" : dailyTrend ?? null;
+  const htfBias = dailyTrend === "BULLISH" && currentClose <= equilibrium ? "BULLISH_DISCOUNT" : dailyTrend === "BEARISH" && currentClose >= equilibrium ? "BEARISH_PREMIUM" : dailyTrend ?? null;
   const htfConflict = dailyTrend === "BULLISH" && h4Trend === "BEARISH" || dailyTrend === "BEARISH" && h4Trend === "BULLISH";
-  const poi = displacement.poi;
-  const poiTouched = poi && m5.some(
-    (candle) => candle.time > m15[m15.length - 1].time && candle.high >= poi.low && candle.low <= poi.high
-  );
-  const state = poi ? poiTouched ? "LTF_CONFIRM_M5" : displacement.swept ? "DISPLACEMENT_CONFIRMED" : "WAITING_POI_TOUCH" : sweep ? "SWEPT" : pools.length ? "LIQUIDITY_FOUND" : "SCANNING";
+  const lastM15Time = closedM15[closedM15.length - 1].time;
+  const m5Eval = evaluateM5Confirmation(m5, lastM15Time, poi);
+  if (poi) {
+    poi.touched = m5Eval.poiTouched;
+  }
+  const m1Eval = evaluateM1Trigger(m1, lastM15Time, poi, m5Eval.m5Confirmed);
+  const isLiquiditySwept = pools.some((p) => p.swept);
+  const setupScoreObj = calculateSetupScore({
+    htfBias,
+    htfConflict,
+    liquiditySwept: isLiquiditySwept,
+    poiPresent: Boolean(poi),
+    bosMssPresent: bosMssResult.detected,
+    m5Confirmed: m5Eval.m5Confirmed,
+    m1Triggered: m1Eval.m1Triggered,
+    displacement: poi ? { poi, swept: isLiquiditySwept } : void 0,
+    trend
+  });
+  let state = "SCANNING";
+  if (poi) {
+    if (m5Eval.m5Confirmed && m1Eval.m1Triggered) {
+      state = "LTF_CONFIRM_M5";
+    } else if (m5Eval.poiTouched) {
+      state = "WAITING_POI_TOUCH";
+    } else {
+      state = "DISPLACEMENT_CONFIRMED";
+    }
+  } else if (activeSweep) {
+    state = "SWEPT";
+  } else if (pools.length) {
+    state = "LIQUIDITY_FOUND";
+  }
+  let direction = setupScoreObj.direction;
+  let suggestedEntry = null;
+  let suggestedSl = null;
+  let suggestedTp = null;
+  if (poi && direction) {
+    const isBull = direction === "BUY";
+    suggestedEntry = currentClose;
+    if (isBull) {
+      suggestedSl = poi.low - averageAtr2 * 0.2;
+      const slDistance = Math.abs(suggestedEntry - suggestedSl);
+      suggestedTp = suggestedEntry + slDistance * 2.5;
+    } else {
+      suggestedSl = poi.high + averageAtr2 * 0.2;
+      const slDistance = Math.abs(suggestedEntry - suggestedSl);
+      suggestedTp = suggestedEntry - slDistance * 2.5;
+    }
+  }
+  const activeSweepPool = activeSweep;
   const diagnostics = [
     `M15 trend ${trend ?? "UNKNOWN"}; daily ${dailyTrend ?? "UNKNOWN"}; H4 ${h4Trend ?? "UNKNOWN"}`,
-    pools.length ? `${pools.length} liquidity pool${pools.length === 1 ? "" : "s"} detected` : "No equal-high/equal-low pool within 0.15 ATR14",
-    sweep ? `${sweep.type} sweep detected in latest M15 candle` : "Waiting for a valid liquidity sweep",
-    poi ? `${poi.type} created at M15 index ${poi.creationIndex}; expires after 50 bars` : "Waiting for displacement body > 1.5 ATR and internal break",
+    pools.length ? `${pools.length} liquidity pool${pools.length === 1 ? "" : "s"} detected (${pools.filter((p) => p.swept).length} swept)` : "No equal-high/equal-low pool within threshold",
+    activeSweepPool ? `${activeSweepPool.type} sweep confirmed on closed candle` : isLiquiditySwept ? "Historical liquidity sweep present on active pool" : "Waiting for a valid liquidity sweep",
+    bosMssResult.detected ? `Structure break detected: ${bosMssResult.type}` : "No structural break (BOS/MSS) confirmed on closed candle",
+    poi ? `${poi.type} created at M15 index ${poi.creationIndex}` : "Waiting for displacement body > 1.2 ATR and internal break",
     htfConflict ? "HTF conflict \u2014 risk must be reduced to 50%" : htfBias ? `HTF location ${htfBias}` : "HTF premium/discount not aligned",
-    state === "LTF_CONFIRM_M5" ? "M15 POI touched; waiting for M5 micro MSS confirmation" : "No executable confirmation yet"
+    m5Eval.diagnostics,
+    m1Eval.diagnostics,
+    `Setup Score: ${setupScoreObj.score}/100 (${setupScoreObj.action})`
   ];
   return {
     realSymbol,
@@ -33832,16 +34130,596 @@ async function analyzeSymbol(accountId, baseSymbol) {
     poiType: poi?.type ?? null,
     poiHigh: poi?.high ?? null,
     poiLow: poi?.low ?? null,
+    setupScore: setupScoreObj.score,
+    scoreAction: setupScoreObj.action,
+    direction,
+    suggestedEntry,
+    suggestedSl,
+    suggestedTp,
+    candleTimestamp: formingCandle.time,
     diagnostics,
     lastUpdated: (/* @__PURE__ */ new Date()).toISOString(),
     liquidityPool: pools,
-    poi
+    poi,
+    bosMssTag: bosMssResult.tag
+  };
+}
+
+// src/lib/account-profile.ts
+function getDefaultPropRules(startingBalance = 1e5) {
+  return {
+    startingBalance,
+    profitTargetPercent: 10,
+    maxDailyLossPercent: 5,
+    maxOverallDrawdownPercent: 10,
+    trailingDrawdown: false,
+    maxPositions: 5,
+    maxTotalExposureLot: 5,
+    maxSymbolExposureLot: 2,
+    minTradingDays: 5,
+    maxLotSize: 2,
+    allowedSymbols: ["EURUSD", "GBPUSD", "XAUUSD", "NAS100", "US30"],
+    newsRestrictions: true,
+    weekendRestrictions: true
+  };
+}
+function getDefaultContestRules() {
+  return {
+    objective: "ROI",
+    targetProfit: 2e3,
+    targetLots: 50,
+    minWinRatePercent: 55,
+    maxDrawdownPercent: 15
+  };
+}
+function evaluatePropSafety(profile, openPositionsLot = 0) {
+  const rules = { ...getDefaultPropRules(profile.startingBalance), ...profile.propRules };
+  const starting = rules.startingBalance > 0 ? rules.startingBalance : profile.startingBalance || 1e5;
+  const equity = profile.currentEquity;
+  const dailyStart = profile.dailyStartingEquity > 0 ? profile.dailyStartingEquity : starting;
+  const highestEq = Math.max(profile.highestEquity, equity, starting);
+  const maxDailyLossAmount = dailyStart * (rules.maxDailyLossPercent / 100);
+  const currentDailyLoss = Math.max(0, dailyStart - equity);
+  const remainingDailyLossBuffer = Math.max(0, maxDailyLossAmount - currentDailyLoss);
+  const remainingDailyLossPercent = remainingDailyLossBuffer / dailyStart * 100;
+  const baseForOverall = rules.trailingDrawdown ? highestEq : starting;
+  const maxOverallDrawdownAmount = baseForOverall * (rules.maxOverallDrawdownPercent / 100);
+  const currentOverallDrawdown = Math.max(0, baseForOverall - equity);
+  const remainingOverallDrawdownBuffer = Math.max(0, maxOverallDrawdownAmount - currentOverallDrawdown);
+  const remainingOverallDrawdownPercent = remainingOverallDrawdownBuffer / baseForOverall * 100;
+  const targetEquity = starting * (1 + rules.profitTargetPercent / 100);
+  const distanceToProfitTarget = Math.max(0, targetEquity - equity);
+  const distanceToProfitTargetPercent = distanceToProfitTarget / starting * 100;
+  const currentDrawdownPercent = (highestEq - equity) / highestEq * 100;
+  const remainingSafeExposureLot = Math.max(0, rules.maxTotalExposureLot - openPositionsLot);
+  const isDefensive = remainingDailyLossBuffer < maxDailyLossAmount * 0.25 || remainingOverallDrawdownBuffer < maxOverallDrawdownAmount * 0.25;
+  let isViolated = false;
+  let violationReason = null;
+  if (currentDailyLoss >= maxDailyLossAmount) {
+    isViolated = true;
+    violationReason = `Prop rule violation: Daily loss limit hit ($${currentDailyLoss.toFixed(2)} >= $${maxDailyLossAmount.toFixed(2)})`;
+  } else if (currentOverallDrawdown >= maxOverallDrawdownAmount) {
+    isViolated = true;
+    violationReason = `Prop rule violation: Overall drawdown limit hit ($${currentOverallDrawdown.toFixed(2)} >= $${maxOverallDrawdownAmount.toFixed(2)})`;
+  }
+  return {
+    currentEquity: equity,
+    currentDrawdownPercent,
+    remainingDailyLossBuffer,
+    remainingDailyLossPercent,
+    remainingOverallDrawdownBuffer,
+    remainingOverallDrawdownPercent,
+    distanceToProfitTarget,
+    distanceToProfitTargetPercent,
+    currentExposureLot: openPositionsLot,
+    remainingSafeExposureLot,
+    isDefensive,
+    isViolated,
+    violationReason
+  };
+}
+function evaluateContestMetrics(profile, closedTrades = []) {
+  const rules = { ...getDefaultContestRules(), ...profile.contestRules };
+  const starting = profile.startingBalance || 1e4;
+  const profit = profile.currentEquity - starting;
+  const roiPercent = profit / starting * 100;
+  const totalLots = closedTrades.reduce((sum, t) => sum + (t.lot || 0), 0);
+  const tradeCount = closedTrades.length;
+  const winCount = closedTrades.filter((t) => t.isWin).length;
+  const winRatePercent = tradeCount > 0 ? winCount / tradeCount * 100 : 0;
+  const highestEq = Math.max(profile.highestEquity, profile.currentEquity, starting);
+  const maxDrawdownPercent = (highestEq - profile.currentEquity) / highestEq * 100;
+  let objectiveProgressPercent = 0;
+  switch (rules.objective) {
+    case "PROFIT":
+      objectiveProgressPercent = rules.targetProfit && rules.targetProfit > 0 ? Math.min(100, Math.max(0, profit / rules.targetProfit * 100)) : Math.max(0, roiPercent);
+      break;
+    case "ROI":
+      objectiveProgressPercent = Math.min(100, Math.max(0, roiPercent));
+      break;
+    case "VOLUME":
+    case "LOTS_TRADED":
+      objectiveProgressPercent = rules.targetLots && rules.targetLots > 0 ? Math.min(100, totalLots / rules.targetLots * 100) : 100;
+      break;
+    case "RISK_ADJUSTED_RETURN":
+      const riskAdj = maxDrawdownPercent > 0 ? roiPercent / maxDrawdownPercent : roiPercent;
+      objectiveProgressPercent = Math.min(100, Math.max(0, riskAdj * 10));
+      break;
+    default:
+      objectiveProgressPercent = Math.min(100, Math.max(0, roiPercent));
+  }
+  return {
+    objective: rules.objective,
+    profit,
+    roiPercent,
+    lotsTraded: totalLots,
+    tradeCount,
+    maxDrawdownPercent,
+    winRatePercent,
+    objectiveProgressPercent
+  };
+}
+
+// src/lib/market.ts
+var NEWS_SYMBOLS = {
+  XAUUSD: ["USD"],
+  NAS100: ["USD"],
+  US30: ["USD"],
+  EURUSD: ["EUR", "USD"],
+  GBPUSD: ["GBP", "USD"]
+};
+function currenciesForSymbol(symbol) {
+  return NEWS_SYMBOLS[symbol] ?? ["USD"];
+}
+async function hasHighImpactNewsWithin(symbol, minutes) {
+  const token = process.env.FINNHUB_API_KEY;
+  if (!token) {
+    logger.warn("FINNHUB_API_KEY missing; skipping news blackout filter");
+    return { blocked: false, event: null, warning: "Missing FINNHUB_API_KEY" };
+  }
+  const now = /* @__PURE__ */ new Date();
+  const end = new Date(now.getTime() + minutes * 6e4);
+  const from = now.toISOString().slice(0, 10);
+  const to = end.toISOString().slice(0, 10);
+  try {
+    const response = await fetch(
+      `https://finnhub.io/api/v1/calendar/economic?from=${from}&to=${to}&token=${encodeURIComponent(token)}`
+    );
+    if (!response.ok) {
+      logger.warn({ status: response.status }, "Finnhub calendar request failed");
+      return { blocked: false, event: null, warning: "News service unavailable" };
+    }
+    const payload = await response.json();
+    const currencies = currenciesForSymbol(symbol);
+    const nowMs = now.getTime();
+    const windowMs = minutes * 6e4;
+    const event = (payload.economicCalendar ?? []).find((candidate) => {
+      const timeMs = candidate.time ? new Date(candidate.time).getTime() : NaN;
+      return candidate.impact?.toLowerCase() === "high" && currencies.includes(candidate.country ?? "") && Number.isFinite(timeMs) && Math.abs(timeMs - nowMs) <= windowMs;
+    });
+    return event ? { blocked: true, event: event.event ?? "High impact event" } : { blocked: false, event: null };
+  } catch (error) {
+    logger.warn({ error }, "Error querying Finnhub economic calendar");
+    return { blocked: false, event: null, warning: "News service error" };
+  }
+}
+
+// src/lib/risk-engine.ts
+async function evaluateTradeRisk(input) {
+  const violations = [];
+  const warnings = [];
+  let riskMultiplier = 1;
+  const {
+    accountId,
+    symbol,
+    equity,
+    balance,
+    openPositions,
+    spreadInfo,
+    riskSettings = {}
+  } = input;
+  if (!Number.isFinite(equity) || equity <= 0 || !Number.isFinite(balance) || balance <= 0) {
+    return {
+      passed: false,
+      violations: ["Fail-Closed: Live broker equity and balance must be valid positive numbers"],
+      warnings: [],
+      riskMultiplier: 0
+    };
+  }
+  const dailyLossLimitPct = riskSettings.dailyLoss ?? 3;
+  const weeklyLossLimitPct = riskSettings.weeklyLoss ?? 6;
+  const maxTotalExposure = riskSettings.maxTotalExposureLot ?? 5;
+  const maxSymbolExposure = riskSettings.maxSymbolExposureLot ?? 2;
+  const maxConcurrentPositions = riskSettings.maxConcurrentPositions ?? 5;
+  const consecutiveLossLimit = riskSettings.consecutiveLossLimit ?? 3;
+  const symbolCooldownMinutes = riskSettings.symbolCooldownMinutes ?? 15;
+  const newsMinutes = riskSettings.newsMinutes ?? 30;
+  const emergencyEquityFloor = riskSettings.emergencyEquityFloor ?? 0;
+  if (emergencyEquityFloor > 0 && equity <= emergencyEquityFloor) {
+    violations.push(`Account equity ($${equity.toFixed(2)}) is at or below emergency equity floor ($${emergencyEquityFloor.toFixed(2)})`);
+  }
+  const symbolOpenPositions = openPositions.filter((p) => p.symbol === symbol);
+  if (symbolOpenPositions.length > 0) {
+    violations.push(`Duplicate open position on symbol ${symbol} already exists`);
+  }
+  if (openPositions.length >= maxConcurrentPositions) {
+    violations.push(`Maximum concurrent positions limit (${maxConcurrentPositions}) reached`);
+  }
+  const totalOpenLot = openPositions.reduce((sum, p) => sum + (p.volume ?? 0), 0);
+  if (totalOpenLot >= maxTotalExposure) {
+    violations.push(`Maximum total exposure lot limit (${maxTotalExposure} lots) reached (current: ${totalOpenLot.toFixed(2)})`);
+  }
+  const symbolOpenLot = symbolOpenPositions.reduce((sum, p) => sum + (p.volume ?? 0), 0);
+  if (symbolOpenLot >= maxSymbolExposure) {
+    violations.push(`Maximum symbol exposure lot limit (${maxSymbolExposure} lots) reached on ${symbol}`);
+  }
+  if (spreadInfo) {
+    if (spreadInfo.currentSpread > spreadInfo.maxAllowedSpread) {
+      violations.push(`Current broker spread (${spreadInfo.currentSpread.toFixed(5)}) exceeds maximum allowed spread threshold (${spreadInfo.maxAllowedSpread.toFixed(5)})`);
+    }
+  }
+  const day = /* @__PURE__ */ new Date();
+  if (day.getUTCDay() === 5 && (day.getUTCHours() > 21 || day.getUTCHours() === 21 && day.getUTCMinutes() >= 45)) {
+    violations.push("Friday 21:45 GMT session cutoff \u2014 no new positions allowed before weekend");
+  }
+  try {
+    const profile = await findProfile(accountId);
+    if (profile) {
+      const mode = typeof profile.mode === "string" ? profile.mode : "DEMO";
+      if (mode === "PROP") {
+        const startingBalance = Number(profile.starting_balance);
+        const highestEquity = Number(profile.highest_equity ?? Math.max(equity, startingBalance));
+        const dailyStartingEquity = Number(profile.daily_starting_equity ?? balance);
+        if (!Number.isFinite(startingBalance) || startingBalance <= 0 || !Number.isFinite(highestEquity) || highestEquity <= 0 || !Number.isFinite(dailyStartingEquity) || dailyStartingEquity <= 0) {
+          violations.push("Fail-Closed: PROP safety evaluation unavailable due to invalid equity metrics");
+        } else {
+          const accountProfile = {
+            id: accountId,
+            mode: "PROP",
+            startingBalance,
+            currentBalance: balance,
+            currentEquity: equity,
+            highestEquity,
+            dailyStartingEquity,
+            propRules: getDefaultPropRules(startingBalance)
+          };
+          const propSafety = evaluatePropSafety(accountProfile, totalOpenLot);
+          if (propSafety.isViolated) {
+            violations.push(propSafety.violationReason ?? "Prop account rule violated");
+          } else if (propSafety.isDefensive) {
+            warnings.push("PROP Account approaching risk limit (defensive posture active); trade risk reduced by 50%");
+            riskMultiplier *= 0.5;
+          }
+        }
+      }
+    }
+  } catch (error) {
+    logger.error({ accountId, error }, "CRITICAL: Fail-Closed PROP safety evaluation exception");
+    violations.push("Fail-Closed: PROP safety evaluation unavailable");
+  }
+  try {
+    const journalRows = await supabaseRequest("journal", {
+      query: {
+        select: "symbol,pnl,status,created_at,closed_at",
+        account_id: `eq.${accountId}`,
+        status: "eq.CLOSED",
+        order: "closed_at.desc",
+        limit: 100
+      }
+    });
+    const now = Date.now();
+    const dayPnl = journalRows.filter((row) => now - new Date(String(row.closed_at ?? row.created_at ?? 0)).getTime() <= 864e5).reduce((sum, row) => sum + Number(row.pnl ?? 0), 0);
+    const weekPnl = journalRows.filter((row) => now - new Date(String(row.closed_at ?? row.created_at ?? 0)).getTime() <= 7 * 864e5).reduce((sum, row) => sum + Number(row.pnl ?? 0), 0);
+    const maxDailyLossAmount = equity * dailyLossLimitPct / 100;
+    if (dayPnl <= -maxDailyLossAmount) {
+      violations.push(`Daily loss limit reached ($${Math.abs(dayPnl).toFixed(2)} >= $${maxDailyLossAmount.toFixed(2)} max)`);
+    }
+    const maxWeeklyLossAmount = equity * weeklyLossLimitPct / 100;
+    if (weekPnl <= -maxWeeklyLossAmount) {
+      violations.push(`Weekly loss limit reached ($${Math.abs(weekPnl).toFixed(2)} >= $${maxWeeklyLossAmount.toFixed(2)} max)`);
+    }
+    const lastSymbolTrade = journalRows.find((row) => row.symbol === symbol);
+    if (lastSymbolTrade?.closed_at) {
+      const closedAtMs = new Date(String(lastSymbolTrade.closed_at)).getTime();
+      const elapsedMinutes = (now - closedAtMs) / (1e3 * 60);
+      if (elapsedMinutes < symbolCooldownMinutes) {
+        violations.push(`Symbol ${symbol} re-entry cooldown active (closed ${elapsedMinutes.toFixed(1)} mins ago, required: ${symbolCooldownMinutes} mins)`);
+      }
+    }
+    let consecutiveLosses = 0;
+    for (const row of journalRows) {
+      const pnl = Number(row.pnl ?? 0);
+      if (pnl < 0) {
+        consecutiveLosses += 1;
+      } else if (pnl > 0) {
+        break;
+      }
+    }
+    if (consecutiveLosses >= consecutiveLossLimit) {
+      warnings.push(`${consecutiveLosses} consecutive losses detected; reducing trade risk by 50%`);
+      riskMultiplier *= 0.5;
+    }
+  } catch (error) {
+    logger.warn({ accountId, error }, "Risk engine journal history check skipped due to query error");
+  }
+  try {
+    const news = await hasHighImpactNewsWithin(symbol, newsMinutes);
+    if (news.blocked) {
+      violations.push(`High-impact news event active: ${news.event}`);
+    }
+  } catch (error) {
+    logger.warn({ symbol, error }, "News filter check error in risk engine");
+  }
+  const passed = violations.length === 0;
+  if (!passed) {
+    riskMultiplier = 0;
+  }
+  return {
+    passed,
+    violations,
+    warnings,
+    riskMultiplier
+  };
+}
+
+// src/lib/execution-pipeline.ts
+function getPriceTolerance(symbol) {
+  const activeSymbol = symbol.toUpperCase();
+  return activeSymbol.includes("XAU") || activeSymbol.includes("GOLD") ? 0.5 : activeSymbol.includes("US30") || activeSymbol.includes("NAS") || activeSymbol.includes("US100") || activeSymbol.includes("DJ30") ? 5 : 5e-4;
+}
+async function runPostExecutionPipeline(input) {
+  const logs = [];
+  logs.push(`Initiating order request for ${input.symbol} (${input.direction} ${input.lot} lots)`);
+  let orderResult;
+  try {
+    orderResult = await executeMetaApiTrade({
+      accountId: input.accountId,
+      actionType: input.direction === "BUY" ? "ORDER_TYPE_BUY" : "ORDER_TYPE_SELL",
+      symbol: input.realSymbol ?? input.symbol,
+      volume: input.lot,
+      stopLoss: input.sl,
+      takeProfit: input.tp
+    });
+    logs.push(`Broker accepted order request (orderId: ${orderResult.orderId ?? "N/A"}, positionId: ${orderResult.positionId ?? "N/A"})`);
+  } catch (error) {
+    const err = error instanceof Error ? error.message : String(error);
+    logs.push(`Order request rejected by broker: ${err}`);
+    return {
+      success: false,
+      orderId: null,
+      positionId: null,
+      verifiedPosition: null,
+      slVerified: false,
+      tpVerified: false,
+      error: err,
+      logs
+    };
+  }
+  const orderId = typeof orderResult.orderId === "string" ? orderResult.orderId : null;
+  const initialPositionId = typeof orderResult.positionId === "string" ? orderResult.positionId : null;
+  let verifiedPosition = null;
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    try {
+      const snapshot = await getLiveAccountSnapshot(input.accountId);
+      const targetSymbol = input.realSymbol ?? input.symbol;
+      const matched = snapshot.positions.find((p) => {
+        if (initialPositionId && p.id === initialPositionId) return true;
+        return p.symbol === targetSymbol && Boolean(p.type?.toUpperCase().includes(input.direction)) && Math.abs((p.volume ?? 0) - input.lot) < 1e-4;
+      });
+      if (matched) {
+        verifiedPosition = matched;
+        logs.push(`Position verified on broker snapshot (Attempt ${attempt}): ID ${matched.id ?? "N/A"}`);
+        break;
+      }
+    } catch (err) {
+      logs.push(`Broker snapshot verification attempt ${attempt} warning: ${String(err)}`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+  if (!verifiedPosition) {
+    logs.push("CRITICAL: Order accepted but position not found in live account snapshot!");
+    return {
+      success: true,
+      // Order succeeded, but protection verification needs attention
+      orderId,
+      positionId: initialPositionId,
+      verifiedPosition: null,
+      slVerified: false,
+      tpVerified: false,
+      error: "Position registered but unverified on snapshot",
+      logs
+    };
+  }
+  const tolerance = getPriceTolerance(input.symbol);
+  let slVerified = verifiedPosition.stopLoss !== null && verifiedPosition.stopLoss !== void 0 && Math.abs(verifiedPosition.stopLoss - input.sl) <= tolerance;
+  let tpVerified = verifiedPosition.takeProfit !== null && verifiedPosition.takeProfit !== void 0 && Math.abs(verifiedPosition.takeProfit - input.tp) <= tolerance;
+  logs.push(`Protection Check -> SL attached: ${verifiedPosition.stopLoss ?? "NONE"} (Expected: ${input.sl}), TP attached: ${verifiedPosition.takeProfit ?? "NONE"} (Expected: ${input.tp})`);
+  if ((!slVerified || !tpVerified) && verifiedPosition.id) {
+    logs.push("UNPROTECTED POSITION DETECTED! Triggering emergency position protection modification...");
+    try {
+      await modifyMetaApiPosition({
+        accountId: input.accountId,
+        positionId: verifiedPosition.id,
+        stopLoss: input.sl,
+        takeProfit: input.tp
+      });
+      logs.push("Emergency protection correction request transmitted successfully");
+      const reSnapshot = await getLiveAccountSnapshot(input.accountId);
+      const reMatched = reSnapshot.positions.find((p) => p.id === verifiedPosition?.id);
+      if (reMatched) {
+        verifiedPosition = reMatched;
+        slVerified = reMatched.stopLoss !== null && reMatched.stopLoss !== void 0 && Math.abs(reMatched.stopLoss - input.sl) <= tolerance;
+        tpVerified = reMatched.takeProfit !== null && reMatched.takeProfit !== void 0 && Math.abs(reMatched.takeProfit - input.tp) <= tolerance;
+        logs.push(`Emergency Correction Verification -> SL: ${reMatched.stopLoss ?? "NONE"}, TP: ${reMatched.takeProfit ?? "NONE"}`);
+      }
+    } catch (err) {
+      logs.push(`CRITICAL: Emergency protection modification failed: ${String(err)}`);
+    }
+  }
+  try {
+    await supabaseRequest("journal", {
+      method: "POST",
+      prefer: "return=representation",
+      body: {
+        account_id: input.accountId,
+        symbol: input.symbol,
+        real_symbol: input.realSymbol ?? input.symbol,
+        direction: input.direction,
+        entry: verifiedPosition.openPrice ?? 0,
+        sl: verifiedPosition.stopLoss ?? input.sl,
+        initial_sl: input.sl,
+        tp: verifiedPosition.takeProfit ?? input.tp,
+        lot: input.lot,
+        pnl: 0,
+        r_multiple: 0,
+        status: "OPEN",
+        broker_position_id: verifiedPosition.id ?? initialPositionId,
+        broker_order_id: orderId,
+        broker_status: "OPEN",
+        poi_type: input.poiType ?? null,
+        bos_mss_tag: input.bosMssTag ?? null,
+        htf_bias: null,
+        leverage: input.leverage,
+        margin_used: input.marginUsed
+      }
+    });
+    logs.push("Position registered in persistent journal");
+  } catch (err) {
+    logs.push(`Journal registration warning: ${String(err)}`);
+  }
+  return {
+    success: true,
+    orderId,
+    positionId: verifiedPosition.id ?? initialPositionId,
+    verifiedPosition,
+    slVerified,
+    tpVerified,
+    logs
   };
 }
 
 // src/lib/engine-scheduler.ts
 var running = false;
 var schedulerTimer;
+var accountCycleStore = /* @__PURE__ */ new Map();
+function getAccountCycleStatus(accountId, config) {
+  const activeMinutes = config?.activeMinutes ?? 45;
+  const cooldownMinutes = config?.cooldownMinutes ?? 20;
+  let store = accountCycleStore.get(accountId);
+  if (!store) {
+    store = {
+      state: "ACTIVE",
+      activeMinutes,
+      cooldownMinutes,
+      cycleStartedAt: Date.now(),
+      emergencyStop: false,
+      blockedReason: null
+    };
+    accountCycleStore.set(accountId, store);
+  }
+  if (store.emergencyStop) {
+    return {
+      state: "EMERGENCY_STOP",
+      activeMinutes: store.activeMinutes,
+      cooldownMinutes: store.cooldownMinutes,
+      currentCycleStartedAt: new Date(store.cycleStartedAt).toISOString(),
+      nextStateAt: new Date(store.cycleStartedAt).toISOString(),
+      remainingActiveSeconds: 0,
+      remainingCooldownSeconds: 0,
+      blockedReason: store.blockedReason ?? "Emergency kill switch activated",
+      emergencyStop: true
+    };
+  }
+  const now = Date.now();
+  const elapsedMinutes = (now - store.cycleStartedAt) / (1e3 * 60);
+  if (store.state === "ACTIVE") {
+    if (elapsedMinutes >= store.activeMinutes) {
+      store.state = "COOLDOWN";
+      store.cycleStartedAt = now;
+      logger.info({ accountId }, "Trading cycle transition: ACTIVE -> COOLDOWN");
+    }
+  } else if (store.state === "COOLDOWN") {
+    if (elapsedMinutes >= store.cooldownMinutes) {
+      if (store.blockedReason) {
+        store.state = "BLOCKED";
+      } else {
+        store.state = "ACTIVE";
+        store.cycleStartedAt = now;
+        logger.info({ accountId }, "Trading cycle transition: COOLDOWN -> ACTIVE (Safety passed)");
+      }
+    }
+  } else if (store.state === "BLOCKED") {
+    if (!store.blockedReason) {
+      store.state = "ACTIVE";
+      store.cycleStartedAt = now;
+    }
+  }
+  const currentElapsedSec = Math.floor((now - store.cycleStartedAt) / 1e3);
+  let remainingActiveSeconds = 0;
+  let remainingCooldownSeconds = 0;
+  let nextStateAtMs = store.cycleStartedAt;
+  if (store.state === "ACTIVE") {
+    const totalActiveSec = store.activeMinutes * 60;
+    remainingActiveSeconds = Math.max(0, totalActiveSec - currentElapsedSec);
+    nextStateAtMs = store.cycleStartedAt + totalActiveSec * 1e3;
+  } else if (store.state === "COOLDOWN") {
+    const totalCooldownSec = store.cooldownMinutes * 60;
+    remainingCooldownSeconds = Math.max(0, totalCooldownSec - currentElapsedSec);
+    nextStateAtMs = store.cycleStartedAt + totalCooldownSec * 1e3;
+  }
+  return {
+    state: store.state,
+    activeMinutes: store.activeMinutes,
+    cooldownMinutes: store.cooldownMinutes,
+    currentCycleStartedAt: new Date(store.cycleStartedAt).toISOString(),
+    nextStateAt: new Date(nextStateAtMs).toISOString(),
+    remainingActiveSeconds,
+    remainingCooldownSeconds,
+    blockedReason: store.blockedReason,
+    emergencyStop: store.emergencyStop
+  };
+}
+function setEmergencyKillSwitch(accountId, enabled, reason = "Emergency kill switch engaged") {
+  let store = accountCycleStore.get(accountId);
+  if (!store) {
+    store = {
+      state: enabled ? "EMERGENCY_STOP" : "ACTIVE",
+      activeMinutes: 45,
+      cooldownMinutes: 20,
+      cycleStartedAt: Date.now(),
+      emergencyStop: enabled,
+      blockedReason: enabled ? reason : null
+    };
+    accountCycleStore.set(accountId, store);
+  } else {
+    store.emergencyStop = enabled;
+    if (enabled) {
+      store.state = "EMERGENCY_STOP";
+      store.blockedReason = reason;
+    } else {
+      store.state = "ACTIVE";
+      store.cycleStartedAt = Date.now();
+      store.blockedReason = null;
+    }
+  }
+}
+function updateAccountCycleConfig(accountId, config) {
+  let store = accountCycleStore.get(accountId);
+  if (!store) {
+    store = {
+      state: "ACTIVE",
+      activeMinutes: config.activeMinutes ?? 45,
+      cooldownMinutes: config.cooldownMinutes ?? 20,
+      cycleStartedAt: Date.now(),
+      emergencyStop: false,
+      blockedReason: null
+    };
+    accountCycleStore.set(accountId, store);
+  } else {
+    if (config.activeMinutes) store.activeMinutes = config.activeMinutes;
+    if (config.cooldownMinutes) store.cooldownMinutes = config.cooldownMinutes;
+  }
+}
 function numberValue(value) {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
@@ -33865,7 +34743,7 @@ function findLivePosition(row, positions) {
     }
     const entry = numberValue(row.entry);
     const lot = numberValue(row.lot);
-    return entry !== null && position.openPrice !== null && position.volume !== null && Math.abs(position.openPrice - entry) < 5e-4 && (lot === null || Math.abs(position.volume - lot) < 1e-6);
+    return entry !== null && position.openPrice !== null && position.openPrice !== void 0 && position.volume !== null && position.volume !== void 0 && Math.abs(position.openPrice - entry) < 5e-4 && (lot === null || Math.abs(position.volume - lot) < 1e-6);
   });
   return candidates.length === 1 ? candidates[0] : void 0;
 }
@@ -33923,7 +34801,7 @@ function shouldMoveToBreakEven(row, position) {
   const direction = String(row.direction ?? "").toUpperCase();
   const r = direction === "SELL" ? (entry - currentPrice) / risk : (currentPrice - entry) / risk;
   if (r < 1) return false;
-  if (position.stopLoss === null) return true;
+  if (position.stopLoss === null || position.stopLoss === void 0) return true;
   return direction === "SELL" ? position.stopLoss > entry : position.stopLoss < entry;
 }
 function hasChanges(row, patch) {
@@ -33986,13 +34864,13 @@ async function reconcileAccountJournal(accountId, metaApiAccountId, metadata = {
     const position = findLivePosition(row, live.positions);
     if (position) {
       if (shouldMoveToBreakEven(row, position) && position.id) {
-        const entryPrice = numberValue(row.entry) ?? position.openPrice;
+        const entryPrice = numberValue(row.entry) ?? position.openPrice ?? null;
         if (entryPrice === null) continue;
         await moveMetaApiPositionStopToBreakEven({
           accountId: metaApiAccountId,
           positionId: position.id,
           entryPrice,
-          takeProfit: position.takeProfit
+          takeProfit: position.takeProfit ?? null
         });
         breakEvenMoves += 1;
       }
@@ -34028,17 +34906,132 @@ async function reconcileAccountJournal(accountId, metaApiAccountId, metadata = {
   }
   return { account: live, updated, closed, breakEvenMoves };
 }
+async function evaluateAndAutoExecuteTrade(accountId, metaApiAccountId, symbol) {
+  const cycleStatus = getAccountCycleStatus(accountId);
+  if (cycleStatus.state !== "ACTIVE") {
+    logger.info({ accountId, symbol, cycleState: cycleStatus.state }, "Auto-execution blocked by cycle state (must be ACTIVE)");
+    return;
+  }
+  const result = await analyzeSymbol(accountId, symbol);
+  if (result.scoreAction !== "STRONG_BUY" && result.scoreAction !== "BUY" && result.scoreAction !== "STRONG_SELL" && result.scoreAction !== "SELL" || !result.direction || result.suggestedSl === null || result.suggestedTp === null) {
+    return;
+  }
+  const live = await getLiveAccountSnapshot(metaApiAccountId);
+  if (!live.connected || !live.leverage || !live.equity || !live.balance) {
+    logger.warn({ accountId, symbol }, "Auto-execution blocked: live account unconnected or missing metrics");
+    return;
+  }
+  const realSymbol = await resolveMetaApiSymbol(metaApiAccountId, symbol, result.realSymbol);
+  const [price, specification] = await Promise.all([
+    getMetaApiSymbolPrice(metaApiAccountId, realSymbol),
+    getMetaApiSymbolSpecification(metaApiAccountId, realSymbol)
+  ]);
+  if (price.bid === null || price.ask === null || specification.tickSize === null || specification.tickValue === null || specification.volumeMin === null || specification.volumeMax === null || specification.volumeStep === null) {
+    logger.warn({ accountId, symbol }, "Auto-execution blocked: invalid tick or volume specification");
+    return;
+  }
+  const riskRows = await supabaseRequest("risk_settings", {
+    query: { select: "*", account_id: `eq.${accountId}`, limit: 1 }
+  });
+  const riskRow = riskRows[0] ?? {};
+  const riskSettings = {
+    riskPerTrade: Number(riskRow.risk_per_trade ?? 1),
+    dailyLoss: Number(riskRow.daily_loss ?? 3),
+    weeklyLoss: Number(riskRow.weekly_loss ?? 6),
+    spreadMultiplier: Number(riskRow.spread_multiplier ?? 2.5),
+    newsMinutes: Number(riskRow.news_minutes ?? 30)
+  };
+  const entryPrice = result.direction === "BUY" ? price.ask : price.bid;
+  const slDistance = Math.abs(entryPrice - result.suggestedSl);
+  const spread = price.ask - price.bid;
+  const maxSpread = Math.max(specification.tickSize, 1e-4) * riskSettings.spreadMultiplier;
+  const riskCheck = await evaluateTradeRisk({
+    accountId,
+    symbol,
+    direction: result.direction,
+    equity: live.equity,
+    balance: live.balance,
+    freeMargin: live.freeMargin,
+    openPositions: live.positions.map((p) => ({
+      id: p.id ?? void 0,
+      symbol: p.symbol ?? symbol,
+      volume: p.volume,
+      openPrice: p.openPrice
+    })),
+    spreadInfo: {
+      currentSpread: spread,
+      maxAllowedSpread: maxSpread
+    },
+    riskSettings
+  });
+  if (!riskCheck.passed) {
+    logger.info({ accountId, symbol, violations: riskCheck.violations }, "Auto-execution blocked by authoritative risk check");
+    return;
+  }
+  const effectiveRiskPercent = riskSettings.riskPerTrade / 100 * riskCheck.riskMultiplier;
+  const lossPerLot = slDistance / specification.tickSize * specification.tickValue;
+  if (lossPerLot <= 0) return;
+  const requestedLot = live.equity * effectiveRiskPercent / lossPerLot;
+  const volumeStep = specification.volumeStep;
+  const lot = Math.floor(Math.min(requestedLot, specification.volumeMax) / volumeStep) * volumeStep;
+  if (lot < specification.volumeMin) {
+    logger.info({ accountId, symbol, lot, volumeMin: specification.volumeMin }, "Auto-execution blocked: lot below volumeMin");
+    return;
+  }
+  const marginUsed = lot * (specification.contractSize ?? 1e5) * entryPrice / live.leverage;
+  const pipelineResult = await runPostExecutionPipeline({
+    accountId,
+    symbol,
+    realSymbol,
+    direction: result.direction,
+    lot,
+    sl: result.suggestedSl,
+    tp: result.suggestedTp,
+    poiType: result.poiType ?? void 0,
+    bosMssTag: result.bosMssTag ?? void 0,
+    leverage: live.leverage,
+    marginUsed
+  });
+  logger.info(
+    { accountId, symbol, direction: result.direction, lot, success: pipelineResult.success, slVerified: pipelineResult.slVerified, tpVerified: pipelineResult.tpVerified },
+    "Auto-execution pipeline completed"
+  );
+}
 async function runScheduledAnalysis() {
   if (running || !hasSupabaseConfig() || !process.env.METAAPI_TOKEN) return;
   running = true;
   try {
     const profiles = await supabaseRequest("profiles", {
-      query: { select: "id,metaapi_account_id", limit: 100 }
+      query: { select: "id,metaapi_account_id,mode,starting_balance,balance,equity,highest_equity,daily_starting_equity", limit: 100 }
     });
     await Promise.all(
       profiles.filter(
         (profile) => typeof profile.id === "string" && typeof profile.metaapi_account_id === "string"
       ).map(async (profile) => {
+        const cycleStatus = getAccountCycleStatus(profile.id);
+        let blockedReason = null;
+        if (profile.mode === "PROP") {
+          const accProf = {
+            id: profile.id,
+            mode: "PROP",
+            startingBalance: profile.starting_balance ?? 1e5,
+            currentBalance: profile.balance ?? 1e5,
+            currentEquity: profile.equity ?? 1e5,
+            highestEquity: profile.highest_equity ?? 1e5,
+            dailyStartingEquity: profile.daily_starting_equity ?? 1e5
+          };
+          const propSafety = evaluatePropSafety(accProf);
+          if (propSafety.isViolated) {
+            blockedReason = propSafety.violationReason;
+          }
+        }
+        const cycleStore = accountCycleStore.get(profile.id);
+        if (cycleStore) {
+          cycleStore.blockedReason = blockedReason;
+          if (blockedReason && cycleStore.state !== "EMERGENCY_STOP") {
+            cycleStore.state = "BLOCKED";
+          }
+        }
         await Promise.all(
           SUPPORTED_SYMBOLS.map(async (symbol) => {
             try {
@@ -34059,6 +35052,9 @@ async function runScheduledAnalysis() {
                   updated_at: result.lastUpdated
                 }
               });
+              if (cycleStatus.state === "ACTIVE") {
+                await evaluateAndAutoExecuteTrade(profile.id, profile.metaapi_account_id, symbol);
+              }
             } catch (error) {
               logger.warn(
                 { accountId: profile.id, symbol, error },
@@ -34158,6 +35154,10 @@ function emptySnapshot(diagnostics) {
     dailyPnlPercent: null,
     winRate: null,
     profitFactor: null,
+    cycleStatus: null,
+    accountProfile: null,
+    propSafety: null,
+    contestMetrics: null,
     states: [],
     journal: [],
     equityHistory: [],
@@ -34169,6 +35169,7 @@ function emptySnapshot(diagnostics) {
 router3.get("/dashboard", async (req, res) => {
   try {
     const { accountId } = GetDashboardQueryParams.parse(req.query);
+    const cycleStatus = getAccountCycleStatus(accountId);
     if (!hasSupabaseConfig()) {
       res.json(
         emptySnapshot([
@@ -34213,12 +35214,33 @@ router3.get("/dashboard", async (req, res) => {
     const grossLoss = Math.abs(
       closed.filter((entry) => (entry.pnl ?? 0) < 0).reduce((sum, entry) => sum + (entry.pnl ?? 0), 0)
     );
+    const mode = typeof profile.mode === "string" ? profile.mode : "DEMO";
+    const accountProfile = {
+      id: accountId,
+      mode,
+      startingBalance: typeof profile.starting_balance === "number" ? profile.starting_balance : account.balance ?? 1e4,
+      currentBalance: account.balance ?? 1e4,
+      currentEquity: account.equity ?? 1e4,
+      highestEquity: typeof profile.highest_equity === "number" ? profile.highest_equity : account.equity ?? 1e4,
+      dailyStartingEquity: typeof profile.daily_starting_equity === "number" ? profile.daily_starting_equity : account.equity ?? 1e4,
+      propRules: getDefaultPropRules(typeof profile.starting_balance === "number" ? profile.starting_balance : 1e5)
+    };
+    const openPositionsLot = account.positions.reduce((sum, p) => sum + (p.volume ?? 0), 0);
+    const propSafety = mode === "PROP" ? evaluatePropSafety(accountProfile, openPositionsLot) : null;
+    const contestMetrics = mode === "CONTEST" ? evaluateContestMetrics(
+      accountProfile,
+      closed.map((c) => ({ pnl: c.pnl ?? 0, lot: c.lot ?? 0, isWin: (c.pnl ?? 0) > 0 }))
+    ) : null;
     res.json({
       account,
       dailyPnl: null,
       dailyPnlPercent: null,
       winRate: closed.length ? winners.length / closed.length * 100 : null,
       profitFactor: grossLoss ? grossProfit / grossLoss : null,
+      cycleStatus,
+      accountProfile,
+      propSafety,
+      contestMetrics,
       states: states.map(mapState),
       journal,
       equityHistory: equityRows.map((row) => ({
@@ -34240,6 +35262,51 @@ router3.get("/dashboard", async (req, res) => {
   } catch (error) {
     res.status(400).json({
       error: error instanceof Error ? error.message : "Unable to load dashboard"
+    });
+  }
+});
+router3.post("/dashboard/kill-switch", async (req, res) => {
+  try {
+    const accountId = String(req.body?.accountId ?? "").trim();
+    const enabled = Boolean(req.body?.enabled);
+    const reason = String(req.body?.reason ?? "Manual kill switch triggered").trim();
+    if (!accountId) {
+      res.status(400).json({ error: "accountId is required" });
+      return;
+    }
+    setEmergencyKillSwitch(accountId, enabled, reason);
+    res.json({
+      accountId,
+      enabled,
+      reason,
+      status: getAccountCycleStatus(accountId)
+    });
+  } catch (error) {
+    res.status(400).json({
+      error: error instanceof Error ? error.message : "Unable to toggle kill switch"
+    });
+  }
+});
+router3.post("/dashboard/cycle-config", async (req, res) => {
+  try {
+    const accountId = String(req.body?.accountId ?? "").trim();
+    const activeMinutes = Number(req.body?.activeMinutes);
+    const cooldownMinutes = Number(req.body?.cooldownMinutes);
+    if (!accountId) {
+      res.status(400).json({ error: "accountId is required" });
+      return;
+    }
+    updateAccountCycleConfig(accountId, {
+      activeMinutes: Number.isFinite(activeMinutes) && activeMinutes > 0 ? activeMinutes : void 0,
+      cooldownMinutes: Number.isFinite(cooldownMinutes) && cooldownMinutes > 0 ? cooldownMinutes : void 0
+    });
+    res.json({
+      accountId,
+      status: getAccountCycleStatus(accountId)
+    });
+  } catch (error) {
+    res.status(400).json({
+      error: error instanceof Error ? error.message : "Unable to update cycle config"
     });
   }
 });
@@ -34361,42 +35428,6 @@ function runBacktest(input) {
     candleCount: candles.length,
     dataSource: "MetaApi historical candles"
   };
-}
-
-// src/lib/market.ts
-var NEWS_SYMBOLS = {
-  XAUUSD: ["USD"],
-  NAS100: ["USD"],
-  US30: ["USD"],
-  EURUSD: ["EUR", "USD"],
-  GBPUSD: ["GBP", "USD"]
-};
-function currenciesForSymbol(symbol) {
-  return NEWS_SYMBOLS[symbol] ?? ["USD"];
-}
-async function hasHighImpactNewsWithin(symbol, minutes) {
-  const token = process.env.FINNHUB_API_KEY;
-  if (!token) throw new Error("Add FINNHUB_API_KEY in Secrets");
-  const now = /* @__PURE__ */ new Date();
-  const end = new Date(now.getTime() + minutes * 6e4);
-  const from = now.toISOString().slice(0, 10);
-  const to = end.toISOString().slice(0, 10);
-  const response = await fetch(
-    `https://finnhub.io/api/v1/calendar/economic?from=${from}&to=${to}&token=${encodeURIComponent(token)}`
-  );
-  if (!response.ok) {
-    logger.warn({ status: response.status }, "Finnhub calendar request failed");
-    throw new Error("Finnhub news filter request failed");
-  }
-  const payload = await response.json();
-  const currencies = currenciesForSymbol(symbol);
-  const nowMs = now.getTime();
-  const windowMs = minutes * 6e4;
-  const event = (payload.economicCalendar ?? []).find((candidate) => {
-    const timeMs = candidate.time ? new Date(candidate.time).getTime() : NaN;
-    return candidate.impact?.toLowerCase() === "high" && currencies.includes(candidate.country ?? "") && Number.isFinite(timeMs) && Math.abs(timeMs - nowMs) <= windowMs;
-  });
-  return event ? { blocked: true, event: event.event ?? "High impact event" } : { blocked: false, event: null };
 }
 
 // src/routes/engine.ts
@@ -34555,49 +35586,6 @@ router4.post("/engine/backtest", async (req, res) => {
     res.status(message.startsWith("Add ") ? 400 : 502).json({ error: message });
   }
 });
-async function tradeGate(accountId, symbol, risk, positions) {
-  const diagnostics = [];
-  if (positions.some((position) => position.symbol === symbol)) {
-    diagnostics.push("Duplicate symbol blocked");
-  }
-  const groups = [
-    ["XAUUSD", "NAS100", "US30"],
-    ["EURUSD", "GBPUSD"]
-  ];
-  const group = groups.find((members) => members.includes(symbol));
-  if (group && positions.filter((position) => group.includes(position.symbol)).length >= 2) {
-    diagnostics.push("Correlated position limit reached");
-  }
-  const day = /* @__PURE__ */ new Date();
-  if (day.getUTCDay() === 5 && (day.getUTCHours() > 21 || day.getUTCHours() === 21 && day.getUTCMinutes() >= 45)) {
-    diagnostics.push("Friday 21:45 GMT close \u2014 no new trades");
-  }
-  const journalRows = await supabaseRequest("journal", {
-    query: {
-      select: "pnl,status,created_at",
-      account_id: `eq.${accountId}`,
-      status: "eq.CLOSED",
-      order: "created_at.desc",
-      limit: 500
-    }
-  });
-  const now = Date.now();
-  const dayPnl = journalRows.filter((row) => now - new Date(String(row.created_at ?? 0)).getTime() <= 864e5).reduce((sum, row) => sum + Number(row.pnl ?? 0), 0);
-  const weekPnl = journalRows.filter((row) => now - new Date(String(row.created_at ?? 0)).getTime() <= 7 * 864e5).reduce((sum, row) => sum + Number(row.pnl ?? 0), 0);
-  const equity = Number(risk.__equity ?? 0);
-  if (equity > 0 && dayPnl <= -(equity * Number(risk.daily_loss ?? 3)) / 100) {
-    diagnostics.push(`Daily loss limit reached (${risk.daily_loss ?? 3}%)`);
-  }
-  if (equity > 0 && weekPnl <= -(equity * Number(risk.weekly_loss ?? 6)) / 100) {
-    diagnostics.push(`Weekly loss limit reached (${risk.weekly_loss ?? 6}%)`);
-  }
-  const news = await hasHighImpactNewsWithin(
-    symbol,
-    Number(risk.news_minutes ?? 30)
-  );
-  if (news.blocked) diagnostics.push(`High-impact news blocked: ${news.event}`);
-  return diagnostics;
-}
 router4.post("/engine/execute", async (req, res) => {
   try {
     const input = ExecuteTradeBody.parse(req.body);
@@ -34605,34 +35593,24 @@ router4.post("/engine/execute", async (req, res) => {
     const riskRows = await supabaseRequest("risk_settings", {
       query: { select: "*", account_id: `eq.${input.accountId}`, limit: 1 }
     });
-    const risk = riskRows[0] ?? {
-      risk_per_trade: 1,
-      daily_loss: 3,
-      weekly_loss: 6,
-      news_minutes: 30
+    const riskRow = riskRows[0] ?? {};
+    const riskSettings = {
+      riskPerTrade: Number(riskRow.risk_per_trade ?? 1),
+      dailyLoss: Number(riskRow.daily_loss ?? 3),
+      weeklyLoss: Number(riskRow.weekly_loss ?? 6),
+      spreadMultiplier: Number(riskRow.spread_multiplier ?? 2.5),
+      newsMinutes: Number(riskRow.news_minutes ?? 30)
     };
-    const live = await getLiveAccountSnapshot(input.accountId, {
-      brokerName: typeof profile?.broker_name === "string" ? profile.broker_name : void 0,
-      server: typeof profile?.server === "string" ? profile.server : void 0
-    });
     if (isTradingHalted(input.accountId)) {
       res.status(409).json({ error: "Trading halted by emergency stop; reconnect and explicitly re-arm the account" });
       return;
     }
-    if (!live.connected || !live.leverage || !live.equity) {
-      res.status(409).json({ error: "Real broker leverage and equity are required before trading" });
-      return;
-    }
-    const diagnostics = await tradeGate(
-      input.accountId,
-      input.symbol,
-      { ...risk, __equity: live.equity },
-      live.positions.filter(
-        (position) => typeof position.symbol === "string"
-      )
-    );
-    if (diagnostics.length) {
-      res.status(409).json({ error: diagnostics.join("; ") });
+    const live = await getLiveAccountSnapshot(input.accountId, {
+      brokerName: typeof profile?.broker_name === "string" ? profile.broker_name : void 0,
+      server: typeof profile?.server === "string" ? profile.server : void 0
+    });
+    if (!live.connected || !live.leverage || !live.equity || !live.balance) {
+      res.status(409).json({ error: "Real broker connection, leverage, balance, and equity are required before trading" });
       return;
     }
     const realSymbol = await resolveMetaApiSymbol(
@@ -34658,6 +35636,32 @@ router4.post("/engine/execute", async (req, res) => {
       res.status(409).json({ error: `Broker market status blocks trading: ${specification.tradeMode}` });
       return;
     }
+    const averageAtr2 = candles.length > 15 ? candles.slice(-14).reduce((sum, candle) => sum + candle.high - candle.low, 0) / 14 : 0;
+    const spread = price.ask - price.bid;
+    const maxSpread = Math.max(specification.tickSize, averageAtr2 * 0.1) * riskSettings.spreadMultiplier;
+    const riskCheck = await evaluateTradeRisk({
+      accountId: input.accountId,
+      symbol: input.symbol,
+      direction: input.direction,
+      equity: live.equity,
+      balance: live.balance,
+      freeMargin: live.freeMargin,
+      openPositions: live.positions.map((p) => ({
+        id: p.id ?? void 0,
+        symbol: p.symbol ?? input.symbol,
+        volume: p.volume,
+        openPrice: p.openPrice
+      })),
+      spreadInfo: {
+        currentSpread: spread,
+        maxAllowedSpread: maxSpread
+      },
+      riskSettings
+    });
+    if (!riskCheck.passed) {
+      res.status(409).json({ error: riskCheck.violations.join("; ") });
+      return;
+    }
     const entryPrice = input.direction === "BUY" ? price.ask : price.bid;
     if (input.direction === "BUY" && (input.sl >= entryPrice || input.tp <= entryPrice)) {
       res.status(409).json({ error: "BUY orders require SL below and TP above the live ask" });
@@ -34665,12 +35669,6 @@ router4.post("/engine/execute", async (req, res) => {
     }
     if (input.direction === "SELL" && (input.sl <= entryPrice || input.tp >= entryPrice)) {
       res.status(409).json({ error: "SELL orders require SL above and TP below the live bid" });
-      return;
-    }
-    const last = candles.slice(0, -1).at(-1);
-    const averageAtr2 = candles.length > 15 ? candles.slice(-14).reduce((sum, candle) => sum + candle.high - candle.low, 0) / 14 : 0;
-    if (!last || averageAtr2 <= 0) {
-      res.status(409).json({ error: "Live candle data unavailable; order blocked" });
       return;
     }
     const slDistance = Math.abs(entryPrice - input.sl);
@@ -34684,15 +35682,9 @@ router4.post("/engine/execute", async (req, res) => {
       res.status(409).json({ error: "TP must target a 1:2 to 1:3 risk-to-reward ratio" });
       return;
     }
-    const spread = price.ask - price.bid;
-    const maxSpread = Math.max(specification.tickSize, averageAtr2 * 0.1) * Number(risk.spread_multiplier ?? 2.5);
-    if (spread > maxSpread) {
-      res.status(409).json({ error: "Current broker spread exceeds the configured protection threshold" });
-      return;
-    }
-    const riskPercent = Number(risk.risk_per_trade ?? 1) / 100;
+    const effectiveRiskPercent = riskSettings.riskPerTrade / 100 * riskCheck.riskMultiplier;
     const lossPerLot = slDistance / specification.tickSize * specification.tickValue;
-    const requestedLot = live.equity * riskPercent / lossPerLot;
+    const requestedLot = live.equity * effectiveRiskPercent / lossPerLot;
     const volumeStep = specification.volumeStep;
     const floorLot = (value) => Math.floor(value / volumeStep) * volumeStep;
     const lot = floorLot(Math.min(input.lot, requestedLot, specification.volumeMax));
@@ -34705,45 +35697,26 @@ router4.post("/engine/execute", async (req, res) => {
       res.status(409).json({ error: "Broker free-margin protection blocked this order" });
       return;
     }
-    const result = await executeMetaApiTrade({
+    const pipelineResult = await runPostExecutionPipeline({
       accountId: input.accountId,
-      actionType: input.direction === "BUY" ? "ORDER_TYPE_BUY" : "ORDER_TYPE_SELL",
-      symbol: realSymbol,
-      volume: lot,
-      stopLoss: input.sl,
-      takeProfit: input.tp
+      symbol: input.symbol,
+      realSymbol,
+      direction: input.direction,
+      lot,
+      sl: input.sl,
+      tp: input.tp,
+      poiType: input.poiType ?? void 0,
+      bosMssTag: input.bosMssTag ?? void 0,
+      leverage: live.leverage,
+      marginUsed
     });
-    const orderId = typeof result.orderId === "string" ? result.orderId : typeof result.positionId === "string" ? result.positionId : null;
-    const brokerPositionId = typeof result.positionId === "string" ? result.positionId : null;
-    await supabaseRequest("journal", {
-      method: "POST",
-      prefer: "return=representation",
-      body: {
-        account_id: input.accountId,
-        symbol: input.symbol,
-        real_symbol: realSymbol,
-        direction: input.direction,
-        entry: entryPrice,
-        sl: input.sl,
-        initial_sl: input.sl,
-        tp: input.tp,
-        lot,
-        pnl: 0,
-        r_multiple: 0,
-        status: "OPEN",
-        broker_position_id: brokerPositionId,
-        broker_order_id: typeof result.orderId === "string" ? result.orderId : null,
-        broker_status: "OPEN",
-        poi_type: input.poiType ?? null,
-        bos_mss_tag: input.bosMssTag ?? null,
-        htf_bias: null,
-        leverage: live.leverage,
-        margin_used: marginUsed
-      }
-    });
+    if (!pipelineResult.success) {
+      res.status(502).json({ error: pipelineResult.error ?? "Order execution pipeline failed" });
+      return;
+    }
     res.json({
-      orderId,
-      positionId: brokerPositionId,
+      orderId: pipelineResult.orderId,
+      positionId: pipelineResult.positionId,
       accountId: input.accountId,
       symbol: input.symbol,
       direction: input.direction,
@@ -34753,7 +35726,10 @@ router4.post("/engine/execute", async (req, res) => {
       tp: input.tp,
       leverage: live.leverage,
       marginUsed,
-      status: "OPEN"
+      slVerified: pipelineResult.slVerified,
+      tpVerified: pipelineResult.tpVerified,
+      status: "OPEN",
+      logs: pipelineResult.logs
     });
   } catch (error) {
     const message = errorMessage2(error);
@@ -34943,22 +35919,14 @@ app.use("/api", routes_default);
 var app_default = app;
 
 // src/index.ts
-var rawPort = process.env["PORT"];
-if (!rawPort) {
-  throw new Error(
-    "PORT environment variable is required but was not provided."
-  );
-}
+var rawPort = process.env["PORT"] || "3000";
 var port = Number(rawPort);
 if (Number.isNaN(port) || port <= 0) {
   throw new Error(`Invalid PORT value: "${rawPort}"`);
 }
-var server = app_default.listen(port, (err) => {
-  if (err) {
-    logger.error({ err }, "Error listening on port");
-    process.exit(1);
-  }
-  logger.info({ port }, "Server listening");
+var host = "0.0.0.0";
+var server = app_default.listen(port, host, () => {
+  logger.info({ port, host }, "Server listening on 0.0.0.0");
   startEngineScheduler();
 });
 var shuttingDown = false;

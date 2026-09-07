@@ -2,14 +2,182 @@ import { logger } from "./logger";
 import {
   getLiveAccountSnapshot,
   getMetaApiHistoryDeals,
+  getMetaApiSymbolPrice,
+  getMetaApiSymbolSpecification,
   moveMetaApiPositionStopToBreakEven,
+  resolveMetaApiSymbol,
   type MetaApiHistoryDeal,
 } from "./metaapi";
 import { analyzeSymbol, SUPPORTED_SYMBOLS } from "./strategy";
-import { hasSupabaseConfig, supabaseRequest } from "./supabase";
+import { hasSupabaseConfig, supabaseRequest, findProfile } from "./supabase";
+import {
+  evaluatePropSafety,
+  type AccountProfile,
+  type AccountProfileMode,
+} from "./account-profile";
+import { evaluateTradeRisk } from "./risk-engine";
+import { runPostExecutionPipeline } from "./execution-pipeline";
 
 let running = false;
 let schedulerTimer: ReturnType<typeof setInterval> | undefined;
+
+export type EngineCycleState = "ACTIVE" | "COOLDOWN" | "BLOCKED" | "EMERGENCY_STOP";
+
+export type TradingCycleConfig = {
+  activeMinutes: number; // default 45
+  cooldownMinutes: number; // default 20
+};
+
+export type CycleStatus = {
+  state: EngineCycleState;
+  activeMinutes: number;
+  cooldownMinutes: number;
+  currentCycleStartedAt: string;
+  nextStateAt: string;
+  remainingActiveSeconds: number;
+  remainingCooldownSeconds: number;
+  blockedReason: string | null;
+  emergencyStop: boolean;
+};
+
+const accountCycleStore = new Map<string, {
+  state: EngineCycleState;
+  activeMinutes: number;
+  cooldownMinutes: number;
+  cycleStartedAt: number; // timestamp ms
+  emergencyStop: boolean;
+  blockedReason: string | null;
+}>();
+
+export function getAccountCycleStatus(accountId: string, config?: Partial<TradingCycleConfig>): CycleStatus {
+  const activeMinutes = config?.activeMinutes ?? 45;
+  const cooldownMinutes = config?.cooldownMinutes ?? 20;
+
+  let store = accountCycleStore.get(accountId);
+  if (!store) {
+    store = {
+      state: "ACTIVE",
+      activeMinutes,
+      cooldownMinutes,
+      cycleStartedAt: Date.now(),
+      emergencyStop: false,
+      blockedReason: null,
+    };
+    accountCycleStore.set(accountId, store);
+  }
+
+  if (store.emergencyStop) {
+    return {
+      state: "EMERGENCY_STOP",
+      activeMinutes: store.activeMinutes,
+      cooldownMinutes: store.cooldownMinutes,
+      currentCycleStartedAt: new Date(store.cycleStartedAt).toISOString(),
+      nextStateAt: new Date(store.cycleStartedAt).toISOString(),
+      remainingActiveSeconds: 0,
+      remainingCooldownSeconds: 0,
+      blockedReason: store.blockedReason ?? "Emergency kill switch activated",
+      emergencyStop: true,
+    };
+  }
+
+  const now = Date.now();
+  const elapsedMinutes = (now - store.cycleStartedAt) / (1000 * 60);
+
+  if (store.state === "ACTIVE") {
+    if (elapsedMinutes >= store.activeMinutes) {
+      // Transition to COOLDOWN
+      store.state = "COOLDOWN";
+      store.cycleStartedAt = now;
+      logger.info({ accountId }, "Trading cycle transition: ACTIVE -> COOLDOWN");
+    }
+  } else if (store.state === "COOLDOWN") {
+    if (elapsedMinutes >= store.cooldownMinutes) {
+      // Safety Check before resuming ACTIVE
+      if (store.blockedReason) {
+        store.state = "BLOCKED";
+      } else {
+        store.state = "ACTIVE";
+        store.cycleStartedAt = now;
+        logger.info({ accountId }, "Trading cycle transition: COOLDOWN -> ACTIVE (Safety passed)");
+      }
+    }
+  } else if (store.state === "BLOCKED") {
+    if (!store.blockedReason) {
+      store.state = "ACTIVE";
+      store.cycleStartedAt = now;
+    }
+  }
+
+  const currentElapsedSec = Math.floor((now - store.cycleStartedAt) / 1000);
+  let remainingActiveSeconds = 0;
+  let remainingCooldownSeconds = 0;
+  let nextStateAtMs = store.cycleStartedAt;
+
+  if (store.state === "ACTIVE") {
+    const totalActiveSec = store.activeMinutes * 60;
+    remainingActiveSeconds = Math.max(0, totalActiveSec - currentElapsedSec);
+    nextStateAtMs = store.cycleStartedAt + totalActiveSec * 1000;
+  } else if (store.state === "COOLDOWN") {
+    const totalCooldownSec = store.cooldownMinutes * 60;
+    remainingCooldownSeconds = Math.max(0, totalCooldownSec - currentElapsedSec);
+    nextStateAtMs = store.cycleStartedAt + totalCooldownSec * 1000;
+  }
+
+  return {
+    state: store.state,
+    activeMinutes: store.activeMinutes,
+    cooldownMinutes: store.cooldownMinutes,
+    currentCycleStartedAt: new Date(store.cycleStartedAt).toISOString(),
+    nextStateAt: new Date(nextStateAtMs).toISOString(),
+    remainingActiveSeconds,
+    remainingCooldownSeconds,
+    blockedReason: store.blockedReason,
+    emergencyStop: store.emergencyStop,
+  };
+}
+
+export function setEmergencyKillSwitch(accountId: string, enabled: boolean, reason = "Emergency kill switch engaged") {
+  let store = accountCycleStore.get(accountId);
+  if (!store) {
+    store = {
+      state: enabled ? "EMERGENCY_STOP" : "ACTIVE",
+      activeMinutes: 45,
+      cooldownMinutes: 20,
+      cycleStartedAt: Date.now(),
+      emergencyStop: enabled,
+      blockedReason: enabled ? reason : null,
+    };
+    accountCycleStore.set(accountId, store);
+  } else {
+    store.emergencyStop = enabled;
+    if (enabled) {
+      store.state = "EMERGENCY_STOP";
+      store.blockedReason = reason;
+    } else {
+      store.state = "ACTIVE";
+      store.cycleStartedAt = Date.now();
+      store.blockedReason = null;
+    }
+  }
+}
+
+export function updateAccountCycleConfig(accountId: string, config: Partial<TradingCycleConfig>) {
+  let store = accountCycleStore.get(accountId);
+  if (!store) {
+    store = {
+      state: "ACTIVE",
+      activeMinutes: config.activeMinutes ?? 45,
+      cooldownMinutes: config.cooldownMinutes ?? 20,
+      cycleStartedAt: Date.now(),
+      emergencyStop: false,
+      blockedReason: null,
+    };
+    accountCycleStore.set(accountId, store);
+  } else {
+    if (config.activeMinutes) store.activeMinutes = config.activeMinutes;
+    if (config.cooldownMinutes) store.cooldownMinutes = config.cooldownMinutes;
+  }
+}
 
 type JournalRow = Record<string, unknown> & {
   id?: string;
@@ -62,7 +230,9 @@ function findLivePosition(
     return (
       entry !== null &&
       position.openPrice !== null &&
+      position.openPrice !== undefined &&
       position.volume !== null &&
+      position.volume !== undefined &&
       Math.abs(position.openPrice - entry) < 0.0005 &&
       (lot === null || Math.abs(position.volume - lot) < 0.000001)
     );
@@ -146,7 +316,7 @@ function shouldMoveToBreakEven(
   const direction = String(row.direction ?? "").toUpperCase();
   const r = direction === "SELL" ? (entry - currentPrice) / risk : (currentPrice - entry) / risk;
   if (r < 1) return false;
-  if (position.stopLoss === null) return true;
+  if (position.stopLoss === null || position.stopLoss === undefined) return true;
   return direction === "SELL" ? position.stopLoss > entry : position.stopLoss < entry;
 }
 
@@ -220,13 +390,13 @@ export async function reconcileAccountJournal(
     const position = findLivePosition(row, live.positions);
     if (position) {
       if (shouldMoveToBreakEven(row, position) && position.id) {
-        const entryPrice = numberValue(row.entry) ?? position.openPrice;
+        const entryPrice = numberValue(row.entry) ?? position.openPrice ?? null;
         if (entryPrice === null) continue;
         await moveMetaApiPositionStopToBreakEven({
           accountId: metaApiAccountId,
           positionId: position.id,
           entryPrice,
-          takeProfit: position.takeProfit,
+          takeProfit: position.takeProfit ?? null,
         });
         breakEvenMoves += 1;
       }
@@ -274,23 +444,198 @@ export async function reconcileAccountJournal(
   return { account: live, updated, closed, breakEvenMoves };
 }
 
+export async function evaluateAndAutoExecuteTrade(
+  accountId: string,
+  metaApiAccountId: string,
+  symbol: string,
+) {
+  const cycleStatus = getAccountCycleStatus(accountId);
+  if (cycleStatus.state !== "ACTIVE") {
+    logger.info({ accountId, symbol, cycleState: cycleStatus.state }, "Auto-execution blocked by cycle state (must be ACTIVE)");
+    return;
+  }
+
+  const result = await analyzeSymbol(accountId, symbol);
+  if (
+    (result.scoreAction !== "STRONG_BUY" &&
+      result.scoreAction !== "BUY" &&
+      result.scoreAction !== "STRONG_SELL" &&
+      result.scoreAction !== "SELL") ||
+    !result.direction ||
+    result.suggestedSl === null ||
+    result.suggestedTp === null
+  ) {
+    return;
+  }
+
+  const live = await getLiveAccountSnapshot(metaApiAccountId);
+  if (!live.connected || !live.leverage || !live.equity || !live.balance) {
+    logger.warn({ accountId, symbol }, "Auto-execution blocked: live account unconnected or missing metrics");
+    return;
+  }
+
+  const realSymbol = await resolveMetaApiSymbol(metaApiAccountId, symbol, result.realSymbol);
+  const [price, specification] = await Promise.all([
+    getMetaApiSymbolPrice(metaApiAccountId, realSymbol),
+    getMetaApiSymbolSpecification(metaApiAccountId, realSymbol),
+  ]);
+
+  if (
+    price.bid === null ||
+    price.ask === null ||
+    specification.tickSize === null ||
+    specification.tickValue === null ||
+    specification.volumeMin === null ||
+    specification.volumeMax === null ||
+    specification.volumeStep === null
+  ) {
+    logger.warn({ accountId, symbol }, "Auto-execution blocked: invalid tick or volume specification");
+    return;
+  }
+
+  const riskRows = await supabaseRequest<Record<string, unknown>[]>("risk_settings", {
+    query: { select: "*", account_id: `eq.${accountId}`, limit: 1 },
+  });
+  const riskRow = riskRows[0] ?? {};
+  const riskSettings = {
+    riskPerTrade: Number(riskRow.risk_per_trade ?? 1),
+    dailyLoss: Number(riskRow.daily_loss ?? 3),
+    weeklyLoss: Number(riskRow.weekly_loss ?? 6),
+    spreadMultiplier: Number(riskRow.spread_multiplier ?? 2.5),
+    newsMinutes: Number(riskRow.news_minutes ?? 30),
+  };
+
+  const entryPrice = result.direction === "BUY" ? price.ask : price.bid;
+  const slDistance = Math.abs(entryPrice - result.suggestedSl);
+  const spread = price.ask - price.bid;
+  const maxSpread = Math.max(specification.tickSize, 0.0001) * riskSettings.spreadMultiplier;
+
+  const riskCheck = await evaluateTradeRisk({
+    accountId,
+    symbol,
+    direction: result.direction,
+    equity: live.equity,
+    balance: live.balance,
+    freeMargin: live.freeMargin,
+    openPositions: live.positions.map((p) => ({
+      id: p.id ?? undefined,
+      symbol: p.symbol ?? symbol,
+      volume: p.volume,
+      openPrice: p.openPrice,
+    })),
+    spreadInfo: {
+      currentSpread: spread,
+      maxAllowedSpread: maxSpread,
+    },
+    riskSettings,
+  });
+
+  if (!riskCheck.passed) {
+    logger.info({ accountId, symbol, violations: riskCheck.violations }, "Auto-execution blocked by authoritative risk check");
+    return;
+  }
+
+  const effectiveRiskPercent = (riskSettings.riskPerTrade / 100) * riskCheck.riskMultiplier;
+  const lossPerLot = (slDistance / specification.tickSize) * specification.tickValue;
+  if (lossPerLot <= 0) return;
+
+  const requestedLot = (live.equity * effectiveRiskPercent) / lossPerLot;
+  const volumeStep = specification.volumeStep;
+  const lot = Math.floor(Math.min(requestedLot, specification.volumeMax) / volumeStep) * volumeStep;
+
+  if (lot < specification.volumeMin) {
+    logger.info({ accountId, symbol, lot, volumeMin: specification.volumeMin }, "Auto-execution blocked: lot below volumeMin");
+    return;
+  }
+
+  const marginUsed = (lot * (specification.contractSize ?? 100000) * entryPrice) / live.leverage;
+
+  const pipelineResult = await runPostExecutionPipeline({
+    accountId,
+    symbol,
+    realSymbol,
+    direction: result.direction,
+    lot,
+    sl: result.suggestedSl,
+    tp: result.suggestedTp,
+    poiType: result.poiType ?? undefined,
+    bosMssTag: result.bosMssTag ?? undefined,
+    leverage: live.leverage,
+    marginUsed,
+  });
+
+  logger.info(
+    { accountId, symbol, direction: result.direction, lot, success: pipelineResult.success, slVerified: pipelineResult.slVerified, tpVerified: pipelineResult.tpVerified },
+    "Auto-execution pipeline completed",
+  );
+}
+
 async function runScheduledAnalysis() {
   if (running || !hasSupabaseConfig() || !process.env.METAAPI_TOKEN) return;
   running = true;
   try {
     const profiles = await supabaseRequest<
-      Array<{ id?: string; metaapi_account_id?: string }>
+      Array<{
+        id?: string;
+        metaapi_account_id?: string;
+        mode?: AccountProfileMode;
+        starting_balance?: number;
+        balance?: number;
+        equity?: number;
+        highest_equity?: number;
+        daily_starting_equity?: number;
+      }>
     >("profiles", {
-      query: { select: "id,metaapi_account_id", limit: 100 },
+      query: { select: "id,metaapi_account_id,mode,starting_balance,balance,equity,highest_equity,daily_starting_equity", limit: 100 },
     });
+
     await Promise.all(
       profiles
         .filter(
-          (profile): profile is { id: string; metaapi_account_id: string } =>
+          (profile): profile is {
+            id: string;
+            metaapi_account_id: string;
+            mode?: AccountProfileMode;
+            starting_balance?: number;
+            balance?: number;
+            equity?: number;
+            highest_equity?: number;
+            daily_starting_equity?: number;
+          } =>
             typeof profile.id === "string" &&
             typeof profile.metaapi_account_id === "string",
         )
         .map(async (profile) => {
+          const cycleStatus = getAccountCycleStatus(profile.id);
+
+          // Safety Checks on Prop Profile
+          let blockedReason: string | null = null;
+          if (profile.mode === "PROP") {
+            const accProf: AccountProfile = {
+              id: profile.id,
+              mode: "PROP",
+              startingBalance: profile.starting_balance ?? 100000,
+              currentBalance: profile.balance ?? 100000,
+              currentEquity: profile.equity ?? 100000,
+              highestEquity: profile.highest_equity ?? 100000,
+              dailyStartingEquity: profile.daily_starting_equity ?? 100000,
+            };
+            const propSafety = evaluatePropSafety(accProf);
+            if (propSafety.isViolated) {
+              blockedReason = propSafety.violationReason;
+            }
+          }
+
+          // Cycle Safety Override Update
+          const cycleStore = accountCycleStore.get(profile.id);
+          if (cycleStore) {
+            cycleStore.blockedReason = blockedReason;
+            if (blockedReason && cycleStore.state !== "EMERGENCY_STOP") {
+              cycleStore.state = "BLOCKED";
+            }
+          }
+
+          // In both ACTIVE and COOLDOWN modes, scan market & update strategy states
           await Promise.all(
             SUPPORTED_SYMBOLS.map(async (symbol) => {
               try {
@@ -311,6 +656,11 @@ async function runScheduledAnalysis() {
                     updated_at: result.lastUpdated,
                   },
                 });
+
+                // Auto-execute if cycle state is ACTIVE
+                if (cycleStatus.state === "ACTIVE") {
+                  await evaluateAndAutoExecuteTrade(profile.id, profile.metaapi_account_id, symbol);
+                }
               } catch (error) {
                 logger.warn(
                   { accountId: profile.id, symbol, error },
@@ -319,6 +669,8 @@ async function runScheduledAnalysis() {
               }
             }),
           );
+
+          // In both ACTIVE and COOLDOWN modes, manage existing positions & reconcile journal
           try {
             const result = await reconcileAccountJournal(
               profile.id,
