@@ -390,6 +390,7 @@ button:disabled { cursor: not-allowed; opacity: .48; }
 .brand-lockup strong { display: block; font-size: 13px; letter-spacing: -.02em; color: hsl(var(--sidebar-accent-foreground)); }
 .brand-lockup span { display: block; margin-top: 3px; font-family: var(--app-font-mono); font-size: 8px; letter-spacing: .1em; color: hsl(var(--muted-foreground)); }
 .brand-mark { display: grid; place-items: center; width: 32px; height: 32px; color: hsl(var(--primary)); border: 1px solid hsl(var(--primary) / .55); background: hsl(var(--primary) / .08); border-radius: 8px; }
+.brand-mark-brandmark { display: block; width: 32px; height: 32px; object-fit: cover; border-radius: 8px; border: 1px solid hsl(var(--border)); }
 .connection-rail { margin: 0 4px 28px; padding: 13px; border: 1px solid hsl(var(--sidebar-border)); background: hsl(215 30% 12%); border-radius: 7px; }
 .connection-row, .health-line { display: flex; align-items: center; gap: 7px; font-size: 11px; color: hsl(var(--sidebar-foreground)); }
 .connection-row svg { margin-left: auto; color: hsl(var(--primary)); }

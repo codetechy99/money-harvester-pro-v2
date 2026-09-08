@@ -168,7 +168,7 @@ function AppShell({ children }: { children: ReactNode }) {
     <div className="app-frame">
       <aside className={`sidebar ${mobileOpen ? 'sidebar-open' : ''}`}>
         <div className="brand-lockup">
-          <div className="brand-mark"><Crosshair size={18} /></div>
+          <img className="brand-mark-brandmark" src="/favicon.jpg" alt="Money Harvester Pro logo" />
           <div><strong>Money Harvester</strong><span>PRO / CONTROL ROOM</span></div>
           <button className="mobile-close" onClick={() => setMobileOpen(false)} data-testid="button-close-menu"><X size={17} /></button>
         </div>

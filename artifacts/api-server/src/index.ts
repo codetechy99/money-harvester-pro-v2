@@ -1,6 +1,7 @@
 import "dotenv/config";
 import app from "./app";
 import { logger } from "./lib/logger";
+import { ensureSchema } from "./lib/migrate";
 import { startEngineScheduler, stopEngineScheduler } from "./lib/engine-scheduler";
 
 const rawPort = process.env["PORT"];
@@ -17,9 +18,16 @@ if (Number.isNaN(port) || port <= 0) {
   throw new Error(`Invalid PORT value: "${rawPort}"`);
 }
 
-const server = app.listen(port, "0.0.0.0", (err) => {
+const server = app.listen(port, "0.0.0.0", async (err) => {
   if (err) {
     logger.error({ err }, "Error listening on port");
+    process.exit(1);
+  }
+
+  try {
+    await ensureSchema();
+  } catch (schemaError) {
+    logger.error({ err: schemaError }, "Database schema bootstrap failed");
     process.exit(1);
   }
 

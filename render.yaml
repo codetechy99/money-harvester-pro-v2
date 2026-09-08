@@ -1,0 +1,24 @@
+services:
+  - type: web
+    name: money-harvester-pro
+    runtime: node
+    plan: free
+    buildCommand: pnpm install --frozen-lockfile && pnpm run build
+    startCommand: node artifacts/api-server/dist/index.mjs
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: NODE_VERSION
+        value: "22"
+      - key: BASE_PATH
+        value: /
+      - key: METAAPI_TOKEN
+        sync: false
+      - key: DATABASE_URL
+        fromDatabase:
+          name: money-harvester-db
+          property: connectionString
+
+databases:
+  - name: money-harvester-db
+    plan: free
