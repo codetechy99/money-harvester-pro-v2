@@ -1,5 +1,9 @@
 # Money Harvester Pro
 
+<p align="center">
+  <img src="artifacts/money-harvester-pro/public/favicon.jpg" width="120" height="120" alt="Money Harvester Pro logo">
+</p>
+
 > Built by Toxic Tech · advanced by VYLUX TECH
 
 A self-hosted trading control room for MetaTrader accounts via MetaApi. It
