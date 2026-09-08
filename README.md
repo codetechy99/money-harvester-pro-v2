@@ -1,5 +1,7 @@
 # Money Harvester Pro
 
+> Built by Toxic Tech · advanced by VYLUX TECH
+
 A self-hosted trading control room for MetaTrader accounts via MetaApi. It
 runs a live MetaApi connection, a market-structure analysis engine, protected
 (order-ticket) execution, risk-mitigation settings, an equity tracker and a

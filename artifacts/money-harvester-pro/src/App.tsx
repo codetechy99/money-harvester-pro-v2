@@ -188,6 +188,7 @@ function AppShell({ children }: { children: ReactNode }) {
         <div className="sidebar-foot">
           <div className="health-line"><StatusDot tone={healthTone} /><span>API {health.isError ? 'unreachable' : health.isLoading ? 'checking' : 'operational'}</span></div>
           <span className="mono muted-text">v1.0.0 / live mode</span>
+          <span className="mono muted-text brand-credit">Built by Toxic Tech · Advanced by VYLUX TECH</span>
         </div>
       </aside>
       {mobileOpen && <button className="mobile-scrim" onClick={() => setMobileOpen(false)} aria-label="Close navigation" data-testid="button-dismiss-menu" />}

@@ -403,6 +403,7 @@ button:disabled { cursor: not-allowed; opacity: .48; }
 .nav-link-active { color: hsl(var(--sidebar-primary)); background: hsl(var(--sidebar-primary) / .08); border-color: hsl(var(--sidebar-primary) / .17); }
 .nav-caret { margin-left: auto; }
 .sidebar-foot { margin-top: auto; display: grid; gap: 12px; padding: 18px 11px 2px; border-top: 1px solid hsl(var(--sidebar-border)); }
+.sidebar-foot .brand-credit { letter-spacing: .04em; }
 .muted-text { color: hsl(var(--muted-foreground)); font-size: 10px; }
 .mono { font-family: var(--app-font-mono); }
 .main-shell { width: calc(100% - 244px); min-width: 0; }
