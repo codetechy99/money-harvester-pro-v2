@@ -18,7 +18,12 @@ import {
   runPostExecutionPipeline,
   SUPPORTED_SYMBOLS,
 } from "../lib/strategy";
-import { findProfile, supabaseRequest } from "../lib/supabase";
+import {
+  findProfile,
+  saveState,
+  selectRiskSettings,
+  selectStates,
+} from "../lib/db";
 
 const router: IRouter = Router();
 
@@ -50,13 +55,7 @@ function mapState(row: Record<string, unknown>) {
 }
 
 async function loadStates(accountId: string) {
-  const rows = await supabaseRequest<Record<string, unknown>[]>("states", {
-    query: {
-      select: "*",
-      account_id: `eq.${accountId}`,
-      order: "symbol.asc",
-    },
-  });
+  const rows = await selectStates(accountId);
   return rows.map(mapState);
 }
 
@@ -83,21 +82,16 @@ router.post("/engine/run", async (req, res) => {
       symbols.map(async (symbol) => {
         try {
           const result = await analyzeSymbol(input.accountId, symbol);
-          await supabaseRequest("states", {
-            method: "POST",
-            query: { on_conflict: "account_id,symbol" },
-            prefer: "resolution=merge-duplicates,return=representation",
-            body: {
-              account_id: input.accountId,
-              symbol,
-              current_state: result.currentState,
-              liquidity_pool: result.liquidityPool,
-              poi: result.poi,
-              diagnostics_log: result.diagnostics,
-              htf_bias: result.htfBias,
-              htf_conflict: result.htfConflict,
-              updated_at: result.lastUpdated,
-            },
+          await saveState({
+            account_id: input.accountId,
+            symbol,
+            current_state: result.currentState,
+            liquidity_pool: result.liquidityPool,
+            poi: result.poi,
+            diagnostics_log: result.diagnostics,
+            htf_bias: result.htfBias,
+            htf_conflict: result.htfConflict,
+            updated_at: result.lastUpdated,
           });
           return {
             accountId: input.accountId,
@@ -206,10 +200,7 @@ router.post("/engine/execute", async (req, res) => {
   try {
     const input = ExecuteTradeBody.parse(req.body);
     const profile = await findProfile(input.accountId);
-    const riskRows = await supabaseRequest<Record<string, unknown>[]>("risk_settings", {
-      query: { select: "*", account_id: `eq.${input.accountId}`, limit: 1 },
-    });
-    const risk = riskRows[0] ?? {
+    const risk = (await selectRiskSettings(input.accountId)) ?? {
       risk_per_trade: 1,
       daily_loss: 3,
       weekly_loss: 6,

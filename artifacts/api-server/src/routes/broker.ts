@@ -14,7 +14,7 @@ import {
   getMetaApiSymbolSpecification,
   resolveMetaApiSymbol,
 } from "../lib/metaapi";
-import { findProfile, supabaseRequest } from "../lib/supabase";
+import { findProfile, insertEquityPoint, saveProfile, updateProfile } from "../lib/db";
 
 const router: IRouter = Router();
 
@@ -31,22 +31,17 @@ router.post("/broker/connect", async (req, res) => {
   try {
     const input = ConnectBrokerBody.parse(req.body);
     const account = await connectMetaApiAccount(input);
-    await supabaseRequest("profiles", {
-      method: "POST",
-      query: { on_conflict: "id" },
-      prefer: "resolution=merge-duplicates,return=representation",
-      body: {
-        id: account.accountId,
-        metaapi_account_id: account.accountId,
-        broker_name: input.brokerName,
-        server: input.server,
-        login: input.login,
-        leverage: account.leverage,
-        balance: account.balance,
-        equity: account.equity,
-        account_type: account.accountType,
-        connection_state: account.connectionState ?? "CONNECTED",
-      },
+    await saveProfile({
+      id: account.accountId,
+      metaapi_account_id: account.accountId,
+      broker_name: input.brokerName,
+      server: input.server,
+      login: input.login,
+      leverage: account.leverage,
+      balance: account.balance,
+      equity: account.equity,
+      account_type: account.accountType,
+      connection_state: account.connectionState ?? "CONNECTED",
     });
     res.json(account);
   } catch (error) {
@@ -69,24 +64,13 @@ router.get("/broker/balance", async (req, res) => {
         typeof profile?.broker_name === "string" ? profile.broker_name : undefined,
       server: typeof profile?.server === "string" ? profile.server : undefined,
     });
-    await supabaseRequest("profiles", {
-      method: "PATCH",
-      query: { id: `eq.${accountId}` },
-      body: {
-        balance: live.balance,
-        equity: live.equity,
-        leverage: live.leverage,
-      },
+    await updateProfile(accountId, {
+      balance: live.balance,
+      equity: live.equity,
+      leverage: live.leverage,
     });
     if (live.balance !== null && live.equity !== null) {
-      await supabaseRequest("equity_history", {
-        method: "POST",
-        body: {
-          account_id: accountId,
-          balance: live.balance,
-          equity: live.equity,
-        },
-      });
+      await insertEquityPoint(accountId, live.balance, live.equity);
     }
     res.json(live);
   } catch (error) {
@@ -179,11 +163,7 @@ router.post("/broker/disconnect", async (req, res) => {
   try {
     const { accountId } = CloseAllPositionsBody.parse(req.body);
     const result = await disconnectMetaApiAccount(accountId);
-    await supabaseRequest("profiles", {
-      method: "PATCH",
-      query: { id: `eq.${accountId}` },
-      body: { connection_state: "DISCONNECTED" },
-    });
+    await updateProfile(accountId, { connection_state: "DISCONNECTED" });
     res.json({ ok: true, message: "MetaApi account undeployed", count: 0, ...result });
   } catch (error) {
     const message = errorMessage(error);

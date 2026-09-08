@@ -3,7 +3,11 @@ import {
   GetEquityHistoryQueryParams,
   GetJournalQueryParams,
 } from "@workspace/api-zod";
-import { findProfile, supabaseRequest } from "../lib/supabase";
+import {
+  findProfile,
+  selectEquityHistory,
+  selectJournal,
+} from "../lib/db";
 import { logger } from "../lib/logger";
 import { reconcileAccountJournal } from "../lib/engine-scheduler";
 
@@ -51,14 +55,7 @@ router.get("/journal", async (req, res) => {
         logger.warn({ accountId, error }, "Journal refresh reconciliation failed");
       }
     }
-    const rows = await supabaseRequest<Record<string, unknown>[]>("journal", {
-      query: {
-        select: "*",
-        account_id: `eq.${accountId}`,
-        order: "created_at.desc",
-        limit: 100,
-      },
-    });
+    const rows = await selectJournal(accountId, 100);
     res.json(rows.map(mapJournal));
   } catch (error) {
     res.status(400).json({
@@ -70,17 +67,7 @@ router.get("/journal", async (req, res) => {
 router.get("/equity-history", async (req, res) => {
   try {
     const { accountId } = GetEquityHistoryQueryParams.parse(req.query);
-    const rows = await supabaseRequest<Record<string, unknown>[]>(
-      "equity_history",
-      {
-        query: {
-          select: "timestamp,balance,equity",
-          account_id: `eq.${accountId}`,
-          order: "timestamp.asc",
-          limit: 500,
-        },
-      },
-    );
+    const rows = await selectEquityHistory(accountId);
     res.json(
       rows.map((row) => ({
         timestamp: String(row.timestamp ?? ""),

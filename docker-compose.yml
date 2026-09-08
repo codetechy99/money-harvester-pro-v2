@@ -1,0 +1,16 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: money-harvester-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: money
+      POSTGRES_PASSWORD: money
+      POSTGRES_DB: moneyharvester
+    ports:
+      - "5432:5432"
+    volumes:
+      - money-harvester-pgdata:/var/lib/postgresql/data
+
+volumes:
+  money-harvester-pgdata:

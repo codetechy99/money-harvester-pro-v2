@@ -15,7 +15,17 @@ import {
   runPostExecutionPipeline,
   SUPPORTED_SYMBOLS,
 } from "./strategy";
-import { findProfile, hasSupabaseConfig, supabaseRequest } from "./supabase";
+import {
+  findProfile,
+  hasDatabase,
+  insertEquityPoint,
+  listProfileRefs,
+  saveState,
+  selectOpenJournalRows,
+  selectRiskSettings,
+  updateJournal,
+  updateProfile,
+} from "./db";
 
 let running = false;
 let schedulerTimer: ReturnType<typeof setInterval> | undefined;
@@ -171,11 +181,7 @@ function hasChanges(row: JournalRow, patch: Record<string, unknown>) {
 
 async function patchJournalRow(row: JournalRow, patch: Record<string, unknown>) {
   if (!row.id || !hasChanges(row, patch)) return false;
-  await supabaseRequest("journal", {
-    method: "PATCH",
-    query: { id: `eq.${row.id}` },
-    body: { ...patch, broker_updated_at: new Date().toISOString() },
-  });
+  await updateJournal(row.id, { ...patch });
   return true;
 }
 
@@ -185,31 +191,16 @@ export async function reconcileAccountJournal(
   metadata: { brokerName?: string; server?: string } = {},
 ) {
   const live = await getLiveAccountSnapshot(metaApiAccountId, metadata);
-  await supabaseRequest("profiles", {
-    method: "PATCH",
-    query: { id: `eq.${accountId}` },
-    body: {
-      balance: live.balance,
-      equity: live.equity,
-      leverage: live.leverage,
-    },
+  await updateProfile(accountId, {
+    balance: live.balance,
+    equity: live.equity,
+    leverage: live.leverage,
   });
   if (live.balance !== null && live.equity !== null) {
-    await supabaseRequest("equity_history", {
-      method: "POST",
-      body: { account_id: accountId, balance: live.balance, equity: live.equity },
-    });
+    await insertEquityPoint(accountId, live.balance, live.equity);
   }
 
-  const openRows = await supabaseRequest<JournalRow[]>("journal", {
-    query: {
-      select: "*",
-      account_id: `eq.${accountId}`,
-      status: "eq.OPEN",
-      order: "created_at.asc",
-      limit: 500,
-    },
-  });
+  const openRows = await selectOpenJournalRows(accountId);
   let deals: MetaApiHistoryDeal[] = [];
   if (openRows.length) {
     try {
@@ -284,14 +275,10 @@ export async function reconcileAccountJournal(
 }
 
 async function runScheduledAnalysis() {
-  if (running || !hasSupabaseConfig() || !process.env.METAAPI_TOKEN) return;
+  if (running || !hasDatabase() || !process.env.METAAPI_TOKEN) return;
   running = true;
   try {
-    const profiles = await supabaseRequest<
-      Array<{ id?: string; metaapi_account_id?: string }>
-    >("profiles", {
-      query: { select: "id,metaapi_account_id", limit: 100 },
-    });
+    const profiles = await listProfileRefs();
     await Promise.all(
       profiles
         .filter(
@@ -304,30 +291,22 @@ async function runScheduledAnalysis() {
             SUPPORTED_SYMBOLS.map(async (symbol) => {
               try {
                 const result = await analyzeSymbol(profile.id, symbol);
-                await supabaseRequest("states", {
-                  method: "POST",
-                  query: { on_conflict: "account_id,symbol" },
-                  prefer: "resolution=merge-duplicates,return=representation",
-                  body: {
-                    account_id: profile.id,
-                    symbol,
-                    current_state: result.currentState,
-                    liquidity_pool: result.liquidityPool,
-                    poi: result.poi,
-                    diagnostics_log: result.diagnostics,
-                    htf_bias: result.htfBias,
-                    htf_conflict: result.htfConflict,
-                    updated_at: result.lastUpdated,
-                  },
+                await saveState({
+                  account_id: profile.id,
+                  symbol,
+                  current_state: result.currentState,
+                  liquidity_pool: result.liquidityPool,
+                  poi: result.poi,
+                  diagnostics_log: result.diagnostics,
+                  htf_bias: result.htfBias,
+                  htf_conflict: result.htfConflict,
+                  updated_at: result.lastUpdated,
                 });
 
                 // Automated execution trigger check if state is EXECUTABLE and M1 micro confirmation is satisfied
                 if (result.currentState === "EXECUTABLE" && result.m1Triggered && result.poi) {
                   const dbProfile = await findProfile(profile.id);
-                  const riskRows = await supabaseRequest<Record<string, unknown>[]>("risk_settings", {
-                    query: { select: "*", account_id: `eq.${profile.id}`, limit: 1 },
-                  });
-                  const risk = riskRows[0] ?? {};
+                  const risk = (await selectRiskSettings(profile.id)) ?? {};
                   const live = await getLiveAccountSnapshot(profile.metaapi_account_id);
                   const realSymbol = result.realSymbol;
                   const [price, spec, candles] = await Promise.all([

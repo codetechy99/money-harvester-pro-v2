@@ -432,9 +432,9 @@ describe("Pre-Merge Hardening Strategy Pass Tests", () => {
         ],
       }),
       moveMetaApiPositionStopToBreakEven: async () => ({}),
-      supabaseRequest: (async () => {
+      insertJournal: (async () => {
         journalSaved = true;
-        return [];
+        return {};
       }) as any,
     };
 
@@ -485,7 +485,7 @@ describe("Pre-Merge Hardening Strategy Pass Tests", () => {
         positions: [],
       }),
       moveMetaApiPositionStopToBreakEven: async () => ({}),
-      supabaseRequest: (async () => []) as any,
+      insertJournal: (async () => {}) as any,
     };
 
     await assert.rejects(

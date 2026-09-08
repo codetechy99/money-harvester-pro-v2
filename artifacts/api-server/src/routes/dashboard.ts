@@ -1,7 +1,14 @@
 import { Router, type IRouter } from "express";
 import { GetDashboardQueryParams } from "@workspace/api-zod";
 import { reconcileAccountJournal } from "../lib/engine-scheduler";
-import { findProfile, hasSupabaseConfig, supabaseRequest } from "../lib/supabase";
+import {
+  findProfile,
+  hasDatabase,
+  selectEquityHistory,
+  selectJournal,
+  selectRiskSettings,
+  selectStates,
+} from "../lib/db";
 
 const router: IRouter = Router();
 
@@ -72,10 +79,10 @@ function emptySnapshot(diagnostics: string[]) {
 router.get("/dashboard", async (req, res) => {
   try {
     const { accountId } = GetDashboardQueryParams.parse(req.query);
-    if (!hasSupabaseConfig()) {
+    if (!hasDatabase()) {
       res.json(
         emptySnapshot([
-          "Connect Supabase to persist profiles, states, journal, and equity history",
+          "Connect a local Postgres database to persist profiles, states, journal, and equity history",
           "Live broker numbers are intentionally unavailable until a server-side account is connected",
         ]),
       );
@@ -96,18 +103,10 @@ router.get("/dashboard", async (req, res) => {
     );
     const [account, states, journalRows, equityRows, riskRows] = await Promise.all([
       Promise.resolve(reconciliation.account),
-      supabaseRequest<Record<string, unknown>[]>("states", {
-        query: { select: "*", account_id: `eq.${accountId}`, order: "symbol.asc" },
-      }),
-      supabaseRequest<Record<string, unknown>[]>("journal", {
-        query: { select: "*", account_id: `eq.${accountId}`, order: "created_at.desc", limit: 100 },
-      }),
-      supabaseRequest<Record<string, unknown>[]>("equity_history", {
-        query: { select: "timestamp,balance,equity", account_id: `eq.${accountId}`, order: "timestamp.asc", limit: 500 },
-      }),
-      supabaseRequest<Record<string, unknown>[]>("risk_settings", {
-        query: { select: "*", account_id: `eq.${accountId}`, limit: 1 },
-      }),
+      selectStates(accountId),
+      selectJournal(accountId, 100),
+      selectEquityHistory(accountId),
+      selectRiskSettings(accountId).then((row) => (row ? [row] : [])),
     ]);
     const journal = journalRows.map(mapJournal);
     const closed = journal.filter((entry) => entry.status === "CLOSED");

@@ -10,7 +10,7 @@ import {
 } from "./metaapi";
 import { hasHighImpactNewsWithin } from "./market";
 import { logger } from "./logger";
-import { supabaseRequest } from "./supabase";
+import { insertJournal } from "./db";
 
 export { type Candle };
 
@@ -111,14 +111,14 @@ export type PostExecutionPipelineDeps = {
   executeMetaApiTrade: typeof executeMetaApiTrade;
   getLiveAccountSnapshot: typeof getLiveAccountSnapshot;
   moveMetaApiPositionStopToBreakEven: typeof moveMetaApiPositionStopToBreakEven;
-  supabaseRequest?: typeof supabaseRequest;
+  insertJournal?: typeof insertJournal;
 };
 
 const defaultDeps: PostExecutionPipelineDeps = {
   executeMetaApiTrade,
   getLiveAccountSnapshot,
   moveMetaApiPositionStopToBreakEven,
-  supabaseRequest,
+  insertJournal,
 };
 
 function atr(candles: Candle[], period = 14) {
@@ -671,33 +671,29 @@ export async function runPostExecutionPipeline(
   }
 
   // Journal Persistence
-  const requestFunc = deps.supabaseRequest ?? supabaseRequest;
+  const persistFunc = deps.insertJournal ?? insertJournal;
   try {
-    await requestFunc("journal", {
-      method: "POST",
-      prefer: "return=representation",
-      body: {
-        account_id: input.accountId,
-        symbol: input.symbol,
-        real_symbol: input.realSymbol,
-        direction: input.direction,
-        entry: input.entryPrice,
-        sl: input.sl,
-        initial_sl: input.sl,
-        tp: input.tp,
-        lot: input.lot,
-        pnl: 0,
-        r_multiple: 0,
-        status: "OPEN",
-        broker_position_id: brokerPositionId ?? position.id ?? null,
-        broker_order_id: orderId,
-        broker_status: "OPEN",
-        poi_type: input.poiType ?? null,
-        bos_mss_tag: input.bosMssTag ?? null,
-        htf_bias: null,
-        leverage: input.leverage,
-        margin_used: input.marginUsed,
-      },
+    await persistFunc({
+      account_id: input.accountId,
+      symbol: input.symbol,
+      real_symbol: input.realSymbol,
+      direction: input.direction,
+      entry: input.entryPrice,
+      sl: input.sl,
+      initial_sl: input.sl,
+      tp: input.tp,
+      lot: input.lot,
+      pnl: 0,
+      r_multiple: 0,
+      status: "OPEN",
+      broker_position_id: brokerPositionId ?? position.id ?? null,
+      broker_order_id: orderId,
+      broker_status: "OPEN",
+      poi_type: input.poiType ?? null,
+      bos_mss_tag: input.bosMssTag ?? null,
+      htf_bias: null,
+      leverage: input.leverage,
+      margin_used: input.marginUsed,
     });
   } catch (err) {
     logger.warn({ err, accountId: input.accountId, symbol: input.symbol }, "Journal persistence failed following order execution");
